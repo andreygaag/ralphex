@@ -1,0 +1,54 @@
+# Swift development image with ralphex
+# Two-stage: build ralphex for Ubuntu (glibc), then combine with Swift runtime
+
+ARG SWIFT_VERSION=6.0
+
+# Stage 1: build ralphex binary for Ubuntu (Alpine binary uses musl, won't run on Ubuntu)
+FROM golang:bookworm AS build
+WORKDIR /build
+COPY . .
+RUN go build -o /build/ralphex -ldflags "-s -w" ./cmd/ralphex
+
+# Stage 2: Swift + ralphex runtime
+FROM swift:${SWIFT_VERSION}-slim
+
+LABEL org.opencontainers.image.description="Autonomous plan execution with Claude Code - Swift development"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nodejs npm ripgrep git curl gosu \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV USE_BUILTIN_RIPGREP=0
+ENV RALPHEX_DOCKER=1
+ENV CLAUDE_CONFIG_DIR=/home/app/.claude
+
+RUN npm install -g @anthropic-ai/claude-code @openai/codex && \
+    command -v claude >/dev/null || { echo "error: claude CLI not found"; exit 1; } && \
+    command -v codex >/dev/null || { echo "error: codex CLI not found"; exit 1; }
+
+# install rtk (token compression proxy) and opencode
+ARG RTK_VERSION=0.40.0
+ARG OPENCODE_VERSION=1.14.50
+RUN OC_ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
+    case "$(uname -m)" in \
+        x86_64) wget -q "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk_${RTK_VERSION}-1_amd64.deb" -O /tmp/rtk.deb && dpkg -i /tmp/rtk.deb && rm /tmp/rtk.deb ;; \
+        aarch64) wget -qO- "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk-aarch64-unknown-linux-gnu.tar.gz" | tar -xz -C /usr/local/bin ;; \
+    esac && \
+    wget -qO- "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${OC_ARCH}.tar.gz" | tar -xz -C /usr/local/bin && \
+    chmod +x /usr/local/bin/opencode
+
+RUN useradd -m -s /bin/bash app || true
+
+COPY --from=build /build/ralphex /srv/ralphex
+RUN chmod +x /srv/ralphex
+
+COPY scripts/internal/init-docker.sh /srv/init.sh
+RUN chmod +x /srv/init.sh
+
+COPY scripts/internal/entrypoint-ubuntu.sh /srv/entrypoint.sh
+RUN chmod +x /srv/entrypoint.sh
+
+EXPOSE 8080
+WORKDIR /workspace
+
+ENTRYPOINT ["/srv/entrypoint.sh"]
