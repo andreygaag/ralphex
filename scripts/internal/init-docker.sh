@@ -30,3 +30,11 @@ if [ -d /mnt/codex ]; then
     cp -rL /mnt/codex/* /home/app/.codex/ 2>/dev/null || true
     chown -R app:app /home/app/.codex
 fi
+
+# initialize rtk hooks for claude code, codex, and opencode
+if command -v rtk >/dev/null 2>&1; then
+    HOME=/home/app rtk init -g --auto-patch || echo "warning: rtk init (claude) failed"
+    HOME=/home/app rtk init -g --codex --auto-patch || echo "warning: rtk init (codex) failed"
+    HOME=/home/app rtk init -g --opencode --auto-patch || echo "warning: rtk init (opencode) failed"
+    chown -R app:app /home/app/.claude /home/app/.opencode 2>/dev/null || true
+fi

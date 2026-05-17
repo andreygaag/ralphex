@@ -44,6 +44,30 @@ RUN npm install -g @anthropic-ai/claude-code @openai/codex && \
     command -v claude >/dev/null || { echo "error: claude CLI not found"; exit 1; } && \
     command -v codex >/dev/null || { echo "error: codex CLI not found"; exit 1; }
 
+# install rtk (token compression proxy, amd64 only on Alpine) and opencode
+# rtk upstream ships musl/amd64 and glibc/aarch64. The glibc build relies on
+# FORTIFY (__memcpy_chk etc.) and fcntl64 which gcompat does not implement, so
+# on aarch64 Alpine we skip rtk; init-docker.sh gates hook init on
+# `command -v rtk`, so the absence is handled cleanly.
+ARG RTK_VERSION=0.40.0
+ARG OPENCODE_VERSION=1.14.50
+RUN ARCH=$(uname -m) && \
+    OC_ARCH=$(echo "$ARCH" | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
+    case "$ARCH" in \
+        x86_64) \
+            wget -qO- "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk-x86_64-unknown-linux-musl.tar.gz" \
+                | tar -xz -C /usr/local/bin && \
+            chmod +x /usr/local/bin/rtk && \
+            rtk --version ;; \
+        aarch64) \
+            echo "warning: rtk skipped on aarch64 (no Alpine-musl build available upstream)" ;; \
+        *) echo "error: unsupported architecture: $ARCH"; exit 1 ;; \
+    esac && \
+    wget -qO- "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${OC_ARCH}-musl.tar.gz" \
+        | tar -xz -C /usr/local/bin && \
+    chmod +x /usr/local/bin/opencode && \
+    opencode --version
+
 # copy ralphex binary
 COPY --from=build /build/ralphex /srv/ralphex
 RUN chmod +x /srv/ralphex
