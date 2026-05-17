@@ -132,6 +132,11 @@ jobs:
             echo "tag=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}" >> $GITHUB_OUTPUT
             echo "minor=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
             echo "latest=true" >> $GITHUB_OUTPUT
+          elif [[ "$HEAD_BRANCH" == "master" ]]; then
+            # master branch: rolling :master tag also republishes :latest
+            echo "tag=master" >> $GITHUB_OUTPUT
+            echo "minor=" >> $GITHUB_OUTPUT
+            echo "latest=true" >> $GITHUB_OUTPUT
           else
             echo "tag=${HEAD_BRANCH}" >> $GITHUB_OUTPUT
             echo "minor=" >> $GITHUB_OUTPUT
@@ -273,6 +278,11 @@ jobs:
             echo "tag=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}" >> $GITHUB_OUTPUT
             echo "minor=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
             echo "latest=true" >> $GITHUB_OUTPUT
+          elif [[ "$HEAD_BRANCH" == "master" ]]; then
+            # master branch: rolling :master tag also republishes :latest
+            echo "tag=master" >> $GITHUB_OUTPUT
+            echo "minor=" >> $GITHUB_OUTPUT
+            echo "latest=true" >> $GITHUB_OUTPUT
           else
             echo "tag=${HEAD_BRANCH}" >> $GITHUB_OUTPUT
             echo "minor=" >> $GITHUB_OUTPUT
@@ -413,6 +423,11 @@ jobs:
             # semver tag: v0.7.2 -> tags: 0.7.2, 0.7, latest
             echo "tag=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}" >> $GITHUB_OUTPUT
             echo "minor=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+            echo "latest=true" >> $GITHUB_OUTPUT
+          elif [[ "$HEAD_BRANCH" == "master" ]]; then
+            # master branch: rolling :master tag also republishes :latest
+            echo "tag=master" >> $GITHUB_OUTPUT
+            echo "minor=" >> $GITHUB_OUTPUT
             echo "latest=true" >> $GITHUB_OUTPUT
           else
             echo "tag=${HEAD_BRANCH}" >> $GITHUB_OUTPUT
