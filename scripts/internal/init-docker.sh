@@ -30,3 +30,18 @@ if [ -d /mnt/codex ]; then
     cp -rL /mnt/codex/* /home/app/.codex/ 2>/dev/null || true
     chown -R app:app /home/app/.codex
 fi
+
+# initialize rtk hooks for claude code, codex, and opencode
+# --auto-patch applies to claude-target only (codex uses AGENTS.md + RTK.md
+# without hook patching, so --codex rejects --auto-patch). --opencode is an
+# add-on to claude-target so --auto-patch applies there too.
+# rtk telemetry disable runs first to write consent into ~/.config/rtk/config.toml
+# so subsequent rtk invocations (hook, init) do not stall on the interactive
+# "Enable anonymous telemetry? [y/N]" prompt.
+if command -v rtk >/dev/null 2>&1; then
+    HOME=/home/app rtk telemetry disable >/dev/null 2>&1 || echo "warning: rtk telemetry disable failed"
+    HOME=/home/app rtk init -g --auto-patch || echo "warning: rtk init (claude) failed"
+    HOME=/home/app rtk init -g --codex || echo "warning: rtk init (codex) failed"
+    HOME=/home/app rtk init -g --opencode --auto-patch || echo "warning: rtk init (opencode) failed"
+    chown -R app:app /home/app/.claude /home/app/.opencode /home/app/.config 2>/dev/null || true
+fi
