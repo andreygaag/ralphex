@@ -1,0 +1,22 @@
+# Python development image extending base ralphex
+ARG BASE_TAG=latest
+FROM ghcr.io/umputun/ralphex:${BASE_TAG}
+
+LABEL org.opencontainers.image.description="Autonomous plan execution with Claude Code - Python development"
+
+# install uv - modern Python package and project manager
+RUN wget -qO- https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
+
+# install Python development tools (pinned for reproducible builds)
+# UV_TOOL_DIR must be world-readable: build runs as root, but the container
+# executes as `app`, so default ~/.local/share/uv/tools under /root is unreadable
+ARG RUFF_VERSION=0.15.13
+ARG MYPY_VERSION=2.1.0
+ARG PYTEST_VERSION=9.0.3
+ENV UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_TOOL_DIR=/opt/uv/tools
+RUN uv tool install "ruff==${RUFF_VERSION}" && \
+    uv tool install "mypy==${MYPY_VERSION}" && \
+    uv tool install "pytest==${PYTEST_VERSION}" && \
+    chmod -R a+rX /opt/uv && \
+    ruff --version && mypy --version && pytest --version
