@@ -27,15 +27,26 @@ RUN npm install -g @anthropic-ai/claude-code @openai/codex && \
     command -v codex >/dev/null || { echo "error: codex CLI not found"; exit 1; }
 
 # install rtk (token compression proxy) and opencode
+# Debian base is glibc so the upstream linux-gnu builds work natively on both
+# architectures; no source build needed (unlike the Alpine base in Dockerfile).
 ARG RTK_VERSION=0.40.0
 ARG OPENCODE_VERSION=1.14.50
-RUN OC_ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
-    case "$(uname -m)" in \
-        x86_64) wget -q "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk_${RTK_VERSION}-1_amd64.deb" -O /tmp/rtk.deb && dpkg -i /tmp/rtk.deb && rm /tmp/rtk.deb ;; \
-        aarch64) wget -qO- "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk-aarch64-unknown-linux-gnu.tar.gz" | tar -xz -C /usr/local/bin ;; \
+RUN ARCH=$(uname -m) && \
+    OC_ARCH=$(echo "$ARCH" | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
+    case "$ARCH" in \
+        x86_64) \
+            wget -q "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk_${RTK_VERSION}-1_amd64.deb" -O /tmp/rtk.deb && \
+            dpkg -i /tmp/rtk.deb && rm /tmp/rtk.deb ;; \
+        aarch64) \
+            wget -qO- "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk-aarch64-unknown-linux-gnu.tar.gz" \
+                | tar -xz -C /usr/local/bin && \
+            chmod +x /usr/local/bin/rtk ;; \
+        *) echo "error: unsupported architecture: $ARCH"; exit 1 ;; \
     esac && \
-    wget -qO- "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${OC_ARCH}.tar.gz" | tar -xz -C /usr/local/bin && \
-    chmod +x /usr/local/bin/opencode
+    wget -qO- "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${OC_ARCH}.tar.gz" \
+        | tar -xz -C /usr/local/bin && \
+    chmod +x /usr/local/bin/opencode && \
+    rtk --version && opencode --version
 
 RUN useradd -m -s /bin/bash app || true
 
