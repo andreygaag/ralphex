@@ -33,18 +33,18 @@ ARG RTK_VERSION=0.40.0
 ARG OPENCODE_VERSION=1.14.50
 RUN ARCH=$(uname -m) && \
     OC_ARCH=$(echo "$ARCH" | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
-    case "$ARCH" in \
-        x86_64) \
-            wget -q "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk_${RTK_VERSION}-1_amd64.deb" -O /tmp/rtk.deb && \
-            dpkg -i /tmp/rtk.deb && rm /tmp/rtk.deb ;; \
-        aarch64) \
-            wget -qO- "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk-aarch64-unknown-linux-gnu.tar.gz" \
-                | tar -xz -C /usr/local/bin && \
-            chmod +x /usr/local/bin/rtk ;; \
-        *) echo "error: unsupported architecture: $ARCH"; exit 1 ;; \
-    esac && \
-    wget -qO- "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${OC_ARCH}.tar.gz" \
-        | tar -xz -C /usr/local/bin && \
+	case "$ARCH" in \
+		x86_64) \
+			curl -fsSL "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk_${RTK_VERSION}-1_amd64.deb" -o /tmp/rtk.deb && \
+			dpkg -i /tmp/rtk.deb && rm /tmp/rtk.deb ;; \
+		aarch64) \
+			curl -fsSL "https://github.com/rtk-ai/rtk/releases/download/v${RTK_VERSION}/rtk-aarch64-unknown-linux-gnu.tar.gz" \
+				| tar -xz -C /usr/local/bin && \
+			chmod +x /usr/local/bin/rtk ;; \
+		*) echo "error: unsupported architecture: $ARCH"; exit 1 ;; \
+	esac && \
+	curl -fsSL "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${OC_ARCH}.tar.gz" \
+		| tar -xz -C /usr/local/bin && \
     chmod +x /usr/local/bin/opencode && \
     rtk --version && opencode --version
 
