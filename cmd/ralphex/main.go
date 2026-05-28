@@ -34,6 +34,7 @@ type opts struct {
 	MaxIterations           int           `short:"m" long:"max-iterations" description:"maximum task iterations (default: 50)"`
 	MaxExternalIterations   int           `long:"max-external-iterations" default:"0" description:"override external review iteration limit (0 = auto)"`
 	ReviewPatience          int           `long:"review-patience" default:"0" description:"terminate external review after N unchanged rounds (0 = disabled)"`
+	PlanModel               string        `long:"plan-model" description:"model for plan creation as model[:effort] (falls back to --task-model)"`
 	TaskModel               string        `long:"task-model" description:"model for task execution as model[:effort] (e.g., opus, opus:high, :medium)"`
 	ReviewModel             string        `long:"review-model" description:"model for review phases as model[:effort] (falls back to --task-model)"`
 	ClaudeCommand           string        `long:"claude-command" description:"override claude-compatible command for this run"`
@@ -46,10 +47,12 @@ type opts struct {
 	TasksOnly               bool          `short:"t" long:"tasks-only" description:"run only task phase, skip all reviews"`
 	BaseRef                 string        `short:"b" long:"base-ref" description:"override default branch for review diffs (branch name or commit hash)"`
 	Wait                    time.Duration `long:"wait" description:"wait duration on rate limit before retry (e.g. 1h, 30m)"`
-	SessionTimeout          time.Duration `long:"session-timeout" description:"per-session timeout for claude (e.g. 30m, 1h)"`
-	IdleTimeout             time.Duration `long:"idle-timeout" description:"kill claude session after no output for this duration (e.g. 5m, 10m)"`
+	SessionTimeout          time.Duration `long:"session-timeout" description:"per-session timeout for task/review executor (e.g. 30m, 1h); external review in Claude mode excluded"`
+	IdleTimeout             time.Duration `long:"idle-timeout" description:"kill claude/codex executor session after no output for this duration (e.g. 5m, 10m)"`
 	SkipFinalize            bool          `long:"skip-finalize" description:"skip finalize step even if enabled in config"`
 	PreserveAnthropicAPIKey bool          `long:"preserve-anthropic-api-key" description:"pass ANTHROPIC_API_KEY through to claude (for users authenticating Claude Code via API key rather than OAuth/keychain)"`
+	Codex                   bool          `long:"codex" description:"use codex CLI as the executor for task, review, and finalize phases (skips external review)"`
+	PassClaudeMd            bool          `long:"pass-claude-md" description:"pass project CLAUDE.md to codex via project_doc_fallback_filenames; user-level ~/.claude/CLAUDE.md is NOT auto-passed but a one-time setup hint is shown (codex executor only)"`
 	Worktree                bool          `long:"worktree" description:"run in isolated git worktree"`
 	Branch                  string        `long:"branch" description:"override branch name for worktree/branch creation (default: derived from plan filename)"`
 	PlanDescription         string        `long:"plan" description:"create plan interactively (enter plan description)"`
@@ -134,7 +137,14 @@ type startupInfo struct {
 	Mode                    processor.Mode
 	MaxIterations           int
 	ProgressPath            string
-	PreserveAnthropicAPIKey bool // when true, surfaced in the banner so users can spot wrong-context runs before claude bills the wrong account
+	Executor                string
+	PassClaudeMd            bool
+	PreserveAnthropicAPIKey bool   // when true, surfaced in the banner so users can spot wrong-context runs before claude bills the wrong account
+	CodexModel              string // resolved model for codex plan/task phase; "" means codex picks from ~/.codex/config.toml
+	CodexEffort             string // resolved reasoning effort for codex plan/task phase; "" means codex default
+	CodexReviewModel        string // resolved model for codex review phase; shown only when it differs from CodexModel
+	CodexReviewEffort       string // resolved reasoning effort for codex review phase; shown only when it differs from CodexEffort
+	CodexSandbox            string // resolved sandbox for codex executor; always non-empty when Executor == codex
 }
 
 // executePlanRequest holds parameters for plan execution.
@@ -249,7 +259,9 @@ func run(ctx context.Context, o opts) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	applyCLIOverrides(o, cfg)
+	if err := applyCLIOverrides(o, cfg); err != nil { //nolint:govet // intentional shadow: scoped err for early return
+		return err
+	}
 
 	// create colors from config (all colors guaranteed populated via fallback)
 	colors := progress.NewColors(cfg.Colors)
@@ -266,8 +278,15 @@ func run(ctx context.Context, o opts) error {
 		return runWatchOnly(ctx, o, cfg, colors)
 	}
 
-	// check dependencies using configured command (or default "claude")
-	if depErr := checkClaudeDep(cfg); depErr != nil {
+	// check dependencies using configured command (or default "claude").
+	// when executor=codex, claude is not used for any phase, so its absence is fine;
+	// codex itself is checked here so absence is reported up-front rather than
+	// as a cryptic exec failure on the first task.
+	depCheck := checkClaudeDep
+	if cfg.Executor == config.ExecutorCodex {
+		depCheck = checkCodexDep
+	}
+	if depErr := depCheck(cfg); depErr != nil {
 		return depErr
 	}
 
@@ -552,6 +571,17 @@ func executePlan(ctx context.Context, o opts, req executePlanRequest) error {
 		}
 	}
 
+	// resolve effective codex model/effort for the banner so it reflects what
+	// the codex task and review executors actually receive (--task-model /
+	// --review-model resolved against codex_model / codex_reasoning_effort).
+	// only under the codex executor — in claude mode the banner codex lines are
+	// not shown and the max-effort warning would be a false positive (max is a
+	// valid claude effort).
+	var codex codexBannerInfo
+	if req.Config.Executor == config.ExecutorCodex {
+		codex = codexModelBanner(o, req.Config)
+	}
+
 	// print startup info
 	printStartupInfo(startupInfo{
 		PlanFile:                req.PlanFile,
@@ -559,8 +589,18 @@ func executePlan(ctx context.Context, o opts, req executePlanRequest) error {
 		Mode:                    req.Mode,
 		MaxIterations:           resolveMaxIterations(o.MaxIterations, req.Config),
 		ProgressPath:            plr.baseLog.Path(),
+		Executor:                req.Config.Executor,
+		PassClaudeMd:            req.Config.PassClaudeMd,
 		PreserveAnthropicAPIKey: req.Config.PreserveAnthropicAPIKey,
+		CodexModel:              codex.taskModel,
+		CodexEffort:             codex.taskEffort,
+		CodexReviewModel:        codex.reviewModel,
+		CodexReviewEffort:       codex.reviewEffort,
+		CodexSandbox:            req.Config.CodexExecutorSandbox(),
 	}, req.Colors)
+	if codex.maxDropped {
+		req.Colors.Warn().Printf("codex does not support 'max' reasoning effort; ignoring (valid: low, medium, high, xhigh)\n")
+	}
 
 	// create and run the runner
 	r := createRunner(req, o, runnerLog, plr.holder)
@@ -788,6 +828,20 @@ func checkClaudeDep(cfg *config.Config) error {
 	return nil
 }
 
+// checkCodexDep checks that the codex command is available in PATH.
+// used when executor=codex (--codex) so codex absence is reported up-front
+// with a clean message rather than a cryptic exec error on the first task.
+func checkCodexDep(cfg *config.Config) error {
+	codexCmd := cfg.CodexCommand
+	if codexCmd == "" {
+		codexCmd = "codex"
+	}
+	if _, err := exec.LookPath(codexCmd); err != nil {
+		return fmt.Errorf("%s not found in PATH", codexCmd)
+	}
+	return nil
+}
+
 // isWatchOnlyMode returns true if running in watch-only mode.
 // watch-only mode runs the web dashboard without executing any plan.
 func isWatchOnlyMode(o opts, configWatchDirs []string) bool {
@@ -874,6 +928,9 @@ func validateFlags(o opts) error {
 	if o.IdleTimeout < 0 {
 		return fmt.Errorf("--idle-timeout must be non-negative, got %s", o.IdleTimeout)
 	}
+	// --codex / --pass-claude-md / --external-only / --codex-only / --external-review-tool
+	// mutual-exclusion checks are deferred to applyCodexOverrides, which runs after the
+	// config-file merge so that executor=codex coming from config is also enforced.
 	return nil
 }
 
@@ -939,6 +996,7 @@ func printStartupInfo(info startupInfo, colors *progress.Colors) {
 		colors.Info().Printf("request: %s\n", info.PlanDescription)
 		colors.Info().Printf("branch: %s (max %d iterations)\n", info.Branch, info.MaxIterations)
 		colors.Info().Printf("progress log: %s\n", toRelPath(info.ProgressPath))
+		printExecutorInfo(info, colors)
 		if info.PreserveAnthropicAPIKey {
 			colors.Warn().Printf("auth: ANTHROPIC_API_KEY passthrough enabled\n")
 		}
@@ -952,10 +1010,113 @@ func printStartupInfo(info startupInfo, colors *progress.Colors) {
 	}
 	colors.Info().Printf("starting ralphex loop (max %d iterations)%s\n", info.MaxIterations, modeStr)
 	displayMeta(colors, 0, info.PlanFile, info.Branch, info.ProgressPath)
+	printExecutorInfo(info, colors)
 	if info.PreserveAnthropicAPIKey {
 		colors.Warn().Printf("auth: ANTHROPIC_API_KEY passthrough enabled\n")
 	}
 	colors.Info().Printf("\n")
+}
+
+func printExecutorInfo(info startupInfo, colors *progress.Colors) {
+	if info.Executor != config.ExecutorCodex {
+		return
+	}
+	colors.Info().Printf("executor: codex (external review skipped)\n")
+	// codex effective config: skip lines we don't know (ralphex did not
+	// override them, so codex picks from ~/.codex/config.toml). sandbox is
+	// always resolved via CodexExecutorSandbox so it's always present.
+	if info.CodexModel != "" {
+		colors.Info().Printf("  model: %s\n", info.CodexModel)
+	}
+	if info.CodexSandbox != "" {
+		colors.Info().Printf("  sandbox: %s\n", info.CodexSandbox)
+	}
+	if info.CodexEffort != "" {
+		colors.Info().Printf("  reasoning effort: %s\n", info.CodexEffort)
+	}
+	// review model/effort lines appear only when the review phase resolves to a
+	// different model or effort than the task phase (separate --review-model). an
+	// empty review value that still differs from a set task value means the review
+	// executor inherits codex's own config — render that explicitly so the banner
+	// does not imply the review phase reuses the task value.
+	if info.CodexReviewModel != info.CodexModel {
+		colors.Info().Printf("  review model: %s\n", codexBannerValue(info.CodexReviewModel))
+	}
+	if info.CodexReviewEffort != info.CodexEffort {
+		colors.Info().Printf("  review reasoning effort: %s\n", codexBannerValue(info.CodexReviewEffort))
+	}
+	if info.PassClaudeMd {
+		colors.Info().Printf("claude.md: project CLAUDE.md passthrough enabled\n")
+	}
+}
+
+// codexBannerValue renders a resolved codex model/effort value for the startup
+// banner. an empty value means the codex executor inherits that field from the
+// user's ~/.codex/config.toml, so it is labeled explicitly rather than shown blank.
+func codexBannerValue(v string) string {
+	if v == "" {
+		return "(inherits ~/.codex/config.toml)"
+	}
+	return v
+}
+
+// codexBannerInfo holds the resolved codex primary/review model and effort for
+// the startup banner.
+type codexBannerInfo struct {
+	taskModel, taskEffort     string
+	reviewModel, reviewEffort string
+	maxDropped                bool // a claude-only "max" effort was requested and dropped
+}
+
+// codexModelBanner resolves the codex task and review model/effort for the startup
+// banner from the task/review model specs (--task-model / --review-model CLI flag >
+// task_model / review_model config) against codex_model / codex_reasoning_effort. it
+// mirrors the resolution buildCodexExecutors performs so the banner shows what the
+// codex executors will actually receive. review fields equal the task fields unless a
+// distinct review spec is given.
+func codexModelBanner(o opts, cfg *config.Config) codexBannerInfo {
+	taskSpec := cfg.TaskModel
+	if o.TaskModel != "" {
+		taskSpec = o.TaskModel
+	}
+	reviewSpec := cfg.ReviewModel
+	if o.ReviewModel != "" {
+		reviewSpec = o.ReviewModel
+	}
+	taskModel, taskEffort, taskMax := processor.ResolveCodexModelEffort(taskSpec, cfg.CodexModel, cfg.CodexReasoningEffort)
+	info := codexBannerInfo{
+		taskModel: taskModel, taskEffort: taskEffort,
+		reviewModel: taskModel, reviewEffort: taskEffort,
+		maxDropped: taskMax,
+	}
+	if reviewSpec != "" {
+		reviewModel, reviewEffort, reviewMax := processor.ResolveCodexModelEffort(reviewSpec, cfg.CodexModel, cfg.CodexReasoningEffort)
+		info.reviewModel, info.reviewEffort = reviewModel, reviewEffort
+		info.maxDropped = info.maxDropped || reviewMax
+	}
+	return info
+}
+
+// codexPlanBanner resolves the codex model/effort for plan creation. plan_model
+// falls back to task_model, then to codex_model/codex_reasoning_effort defaults.
+func codexPlanBanner(o opts, cfg *config.Config) codexBannerInfo {
+	taskSpec := cfg.TaskModel
+	if o.TaskModel != "" {
+		taskSpec = o.TaskModel
+	}
+	planSpec := cfg.PlanModel
+	if o.PlanModel != "" {
+		planSpec = o.PlanModel
+	}
+	if planSpec == "" {
+		planSpec = taskSpec
+	}
+	planModel, planEffort, maxDropped := processor.ResolveCodexModelEffort(planSpec, cfg.CodexModel, cfg.CodexReasoningEffort)
+	return codexBannerInfo{
+		taskModel: planModel, taskEffort: planEffort,
+		reviewModel: planModel, reviewEffort: planEffort,
+		maxDropped: maxDropped,
+	}
 }
 
 // runPlanMode executes interactive plan creation mode.
@@ -997,6 +1158,14 @@ func runPlanMode(ctx context.Context, o opts, req executePlanRequest, selector *
 
 	maxIter := resolveMaxIterations(o.MaxIterations, req.Config)
 
+	// resolve effective codex model/effort so the plan-mode banner reflects what
+	// the codex executor receives. codex executor only, so the max-effort warning
+	// is not a false positive in claude mode.
+	var codex codexBannerInfo
+	if req.Config.Executor == config.ExecutorCodex {
+		codex = codexPlanBanner(o, req.Config)
+	}
+
 	// print startup info for plan mode
 	printStartupInfo(startupInfo{
 		PlanDescription:         o.PlanDescription,
@@ -1004,8 +1173,18 @@ func runPlanMode(ctx context.Context, o opts, req executePlanRequest, selector *
 		Mode:                    processor.ModePlan,
 		MaxIterations:           maxIter,
 		ProgressPath:            baseLog.Path(),
+		Executor:                req.Config.Executor,
+		PassClaudeMd:            req.Config.PassClaudeMd,
 		PreserveAnthropicAPIKey: req.Config.PreserveAnthropicAPIKey,
+		CodexModel:              codex.taskModel,
+		CodexEffort:             codex.taskEffort,
+		CodexReviewModel:        codex.reviewModel,
+		CodexReviewEffort:       codex.reviewEffort,
+		CodexSandbox:            req.Config.CodexExecutorSandbox(),
 	}, req.Colors)
+	if codex.maxDropped {
+		req.Colors.Warn().Printf("codex does not support 'max' reasoning effort; ignoring (valid: low, medium, high, xhigh)\n")
+	}
 
 	// create input collector
 	collector := input.NewTerminalCollector(o.NoColor)
@@ -1014,10 +1193,15 @@ func runPlanMode(ctx context.Context, o opts, req executePlanRequest, selector *
 	startTime := time.Now()
 
 	// create and configure runner
-	// resolve task model for plan creation (same precedence as task execution)
-	planTaskModel := req.Config.TaskModel
+	taskModel := req.Config.TaskModel
 	if o.TaskModel != "" {
-		planTaskModel = o.TaskModel
+		taskModel = o.TaskModel
+	}
+	if req.Config.PlanModel != "" {
+		taskModel = req.Config.PlanModel
+	}
+	if o.PlanModel != "" {
+		taskModel = o.PlanModel
 	}
 
 	r := processor.New(processor.Config{
@@ -1029,7 +1213,7 @@ func runPlanMode(ctx context.Context, o opts, req executePlanRequest, selector *
 		NoColor:          o.NoColor,
 		IterationDelayMs: req.Config.IterationDelayMs,
 		DefaultBranch:    req.BaseRef,
-		TaskModel:        planTaskModel,
+		TaskModel:        taskModel,
 		AppConfig:        req.Config,
 	}, baseLog, holder)
 	r.SetInputCollector(collector)
@@ -1275,7 +1459,9 @@ func startInterruptWatcher(ctx context.Context, cleanup func()) func() {
 // applyCLIOverrides applies CLI flag overrides to config.
 // uses opts.*Set bools (populated by markFlagsSet) to detect explicitly-set zero values
 // so that e.g. --idle-timeout 0 can disable a non-zero config value.
-func applyCLIOverrides(o opts, cfg *config.Config) {
+// returns an error if a post-merge validation fails (e.g. --pass-claude-md requires
+// codex executor, which may come from config file rather than CLI).
+func applyCLIOverrides(o opts, cfg *config.Config) error {
 	if o.SkipFinalize {
 		cfg.FinalizeEnabled = false
 	}
@@ -1310,6 +1496,48 @@ func applyCLIOverrides(o opts, cfg *config.Config) {
 	if o.customReviewScriptSet {
 		cfg.CustomReviewScript = o.CustomReviewScript
 	}
+	return applyCodexOverrides(o, cfg, os.Stderr)
+}
+
+// applyCodexOverrides applies --codex / --pass-claude-md CLI flags and resolves config-file precedence.
+// when executor is codex (CLI flag or config), force external review off.
+// CLI-flag conflicts with the codex executor (--external-only, --codex-only,
+// --external-review-tool=<non-none>) are hard-errored here post-merge so the
+// config-only case (executor=codex in config + CLI external-review request) is
+// also caught. config-file conflict (executor=codex + external_review_tool=<not-none>
+// without a CLI override) is silently resolved with a warning written to warnW.
+// returns an error when --pass-claude-md is set without a codex executor (from CLI or config).
+func applyCodexOverrides(o opts, cfg *config.Config, warnW io.Writer) error {
+	if o.Codex {
+		cfg.Executor = config.ExecutorCodex
+	}
+	if o.PassClaudeMd {
+		cfg.PassClaudeMd = true
+	}
+	if cfg.PassClaudeMd && cfg.Executor != config.ExecutorCodex {
+		return errors.New("--pass-claude-md requires --codex (or executor = codex in config)")
+	}
+	if cfg.Executor != config.ExecutorCodex {
+		return nil
+	}
+	// post-merge mutex checks: explicit CLI external-review requests conflict with codex executor
+	// whether the executor came from --codex on the CLI or from executor=codex in the config file.
+	if o.ExternalOnly {
+		return errors.New("--external-only is incompatible with codex executor (external review is skipped in codex mode)")
+	}
+	if o.CodexOnly {
+		return errors.New("--codex-only is incompatible with codex executor (external review is skipped in codex mode)")
+	}
+	if o.externalReviewToolSet && o.ExternalReviewTool != "none" {
+		return errors.New("--external-review-tool is incompatible with codex executor (external review is skipped)")
+	}
+	// warn only when the user explicitly set external_review_tool in their config file to
+	// something non-"none" (embedded default doesn't count — that case is silent).
+	if cfg.ExternalReviewToolSet && cfg.ExternalReviewTool != "none" && !o.externalReviewToolSet {
+		fmt.Fprintf(warnW, "warning: config-file external_review_tool=%q overridden to \"none\" because executor=codex\n", cfg.ExternalReviewTool)
+	}
+	cfg.ExternalReviewTool = "none"
+	return nil
 }
 
 // isFlagSet returns true if the named CLI flag was explicitly provided on the command line.
