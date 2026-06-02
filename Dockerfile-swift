@@ -9,8 +9,12 @@ WORKDIR /build
 COPY . .
 RUN go build -o /build/ralphex -ldflags "-s -w" ./cmd/ralphex
 
-# Stage 2: Swift + ralphex runtime
-FROM swift:${SWIFT_VERSION}-slim
+# Stage 2: Swift + ralphex runtime.
+# We use the -noble (Ubuntu 24.04 LTS) variant rather than -slim because the
+# official swift:6.0-slim aarch64 manifest ships without a swift toolchain —
+# `which swift` returns nothing on arm64, even though amd64 has it. -noble
+# works correctly on both architectures.
+FROM swift:${SWIFT_VERSION}-noble
 
 LABEL org.opencontainers.image.description="Autonomous plan execution with Claude Code - Swift development"
 
