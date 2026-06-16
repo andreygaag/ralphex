@@ -58,7 +58,7 @@ func (p *ReviewPhase) Loop(ctx context.Context, prefix string) error {
 	}
 	maxReviewIterations := max(minReviewIterations, p.cfg.MaxIterations/reviewIterationDivisor)
 
-	execName := p.executorName()
+	execName := p.cfg.executorName()
 	for i := 1; i <= maxReviewIterations; i++ {
 		select {
 		case <-ctx.Done():
@@ -71,11 +71,8 @@ func (p *ReviewPhase) Loop(ctx context.Context, prefix string) error {
 
 		execResult := p.policy.Run(ctx, p.exec.Run, p.prompts.SecondReviewPrompt(prefix), execName)
 		result := execResult.Result
-		if result.Error != nil {
-			if err := p.policy.HandlePatternMatchError(result.Error, execName); err != nil {
-				return fmt.Errorf("%s pattern handling: %w", execName, err)
-			}
-			return fmt.Errorf("%s execution: %w", execName, result.Error)
+		if err := wrapExecutorError(p.policy, result.Error, execName); err != nil {
+			return err
 		}
 
 		if result.Signal == SignalFailed {
@@ -88,7 +85,10 @@ func (p *ReviewPhase) Loop(ctx context.Context, prefix string) error {
 		}
 
 		if execResult.TimedOut {
-			p.log.Print("session timed out, retrying review iteration...")
+			p.log.Print("session timed out, retrying review iteration after %s...", retryBackoff)
+			if err := p.policy.Sleep(ctx, retryBackoff); err != nil {
+				return fmt.Errorf("interrupted: %w", err)
+			}
 			continue
 		}
 
@@ -121,14 +121,11 @@ func (p *ReviewPhase) section(iteration int, suffix string) status.Section {
 }
 
 func (p *ReviewPhase) run(ctx context.Context, prompt, phaseLabel string) error {
-	execName := p.executorName()
+	execName := p.cfg.executorName()
 	execResult := p.policy.Run(ctx, p.exec.Run, prompt, execName)
 	result := execResult.Result
-	if result.Error != nil {
-		if err := p.policy.HandlePatternMatchError(result.Error, execName); err != nil {
-			return fmt.Errorf("%s pattern handling: %w", execName, err)
-		}
-		return fmt.Errorf("%s execution: %w", execName, result.Error)
+	if err := wrapExecutorError(p.policy, result.Error, execName); err != nil {
+		return err
 	}
 
 	if result.Signal == SignalFailed {
@@ -148,11 +145,4 @@ func (p *ReviewPhase) run(ctx context.Context, prompt, phaseLabel string) error 
 	}
 
 	return nil
-}
-
-func (p *ReviewPhase) executorName() string {
-	if p.cfg.isCodexExecutor() {
-		return "codex"
-	}
-	return "claude"
 }

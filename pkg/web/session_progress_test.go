@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,37 @@ Started: 2026-01-22 10:30:00
 		assert.Equal(t, "feature-branch", meta.Branch)
 		assert.Equal(t, "full", meta.Mode)
 		assert.Equal(t, time.Date(2026, 1, 22, 10, 30, 0, 0, time.Local), meta.StartTime)
+		assert.Empty(t, meta.Executor, "executor line absent → empty")
+		assert.Empty(t, meta.TaskModel)
+		assert.Empty(t, meta.ReviewModel)
+	})
+
+	t.Run("parses optional executor and model fields", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "progress-test.txt")
+
+		content := `# Ralphex Progress Log
+Plan: docs/plans/my-plan.md
+Branch: feature-branch
+Mode: full
+Executor: codex
+Plan model: opus:high
+Task model: gpt-5.5:high
+Review model: gpt-5.5:low
+Started: 2026-01-22 10:30:00
+------------------------------------------------------------
+`
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+		meta, complete, err := ParseProgressHeader(path)
+		require.NoError(t, err)
+		assert.True(t, complete)
+
+		assert.Equal(t, "codex", meta.Executor)
+		assert.Equal(t, "opus:high", meta.PlanModel)
+		assert.Equal(t, "gpt-5.5:high", meta.TaskModel)
+		assert.Equal(t, "gpt-5.5:low", meta.ReviewModel)
+		assert.Equal(t, "docs/plans/my-plan.md", meta.PlanPath, "Plan model line must not shadow Plan line")
 	})
 
 	t.Run("handles review-only mode", func(t *testing.T) {
@@ -169,6 +201,46 @@ Started: 2026-01-22 10:00:00
 
 		// should not panic
 		m.loadProgressFileIntoSession(path, session)
+	})
+
+	t.Run("emits plain line before pending section", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "progress-plain-after-section.txt")
+
+		content := `# Ralphex Progress Log
+Plan: docs/plan.md
+Branch: main
+Mode: full
+Started: 2026-01-22 10:00:00
+------------------------------------------------------------
+
+--- Review ---
+plain review output
+`
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+		m := NewSessionManager()
+		defer m.Close()
+		session := NewSession("test-plain-after-section", path)
+		defer session.Close()
+
+		require.NoError(t, session.Publish(NewOutputEvent(status.PhaseTask, "seed")))
+		rawEvents, cleanup := subscribeSSEEvents(t, session)
+		defer cleanup()
+		_ = drainChannel(rawEvents, 50*time.Millisecond)
+
+		m.loadProgressFileIntoSession(path, session)
+
+		got := drainChannel(rawEvents, 50*time.Millisecond)
+		require.Len(t, got, 2)
+
+		var first, second Event
+		require.NoError(t, json.Unmarshal([]byte(got[0]), &first))
+		require.NoError(t, json.Unmarshal([]byte(got[1]), &second))
+		assert.Equal(t, EventTypeOutput, first.Type)
+		assert.Equal(t, "plain review output", first.Text)
+		assert.Equal(t, EventTypeSection, second.Type)
+		assert.Equal(t, "Review", second.Section)
 	})
 
 	t.Run("captures diffstats from output line", func(t *testing.T) {

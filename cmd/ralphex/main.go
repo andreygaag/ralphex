@@ -442,6 +442,7 @@ func setupProgressLogger(o opts, req executePlanRequest, branch string) (progres
 			Mode:           string(req.Mode),
 			Branch:         branch,
 			BranchOverride: req.BranchOverride,
+			Params:         runHeaderParams(o, req.Config, req.Mode),
 			NoColor:        o.NoColor,
 		}, req.Colors, holder)
 		if err != nil {
@@ -552,12 +553,14 @@ func executePlan(ctx context.Context, o opts, req executePlanRequest) error {
 	// wrap logger with broadcast logger if --serve is enabled
 	var runnerLog processor.Logger = plr.baseLog
 	if o.Serve {
+		params := runHeaderParams(o, req.Config, req.Mode)
 		dashboard := web.NewDashboard(web.DashboardConfig{
 			BaseLog:         plr.baseLog,
 			Port:            o.Port,
 			Host:            o.Host,
 			PlanFile:        req.PlanFile,
 			Branch:          branch,
+			RunParams:       web.FormatRunParams(params.Executor, params.PlanModel, params.TaskModel, params.ReviewModel),
 			WatchDirs:       o.Watch,
 			ConfigWatchDirs: req.Config.WatchDirs,
 			Colors:          req.Colors,
@@ -711,6 +714,7 @@ func runWithWorktree(ctx context.Context, o opts, req executePlanRequest) (err e
 		Mode:           string(req.Mode),
 		Branch:         branch,
 		BranchOverride: req.BranchOverride,
+		Params:         runHeaderParams(o, req.Config, req.Mode),
 		NoColor:        o.NoColor,
 	}, req.Colors, holder)
 	if err != nil {
@@ -953,18 +957,6 @@ func createRunner(req executePlanRequest, o opts, log processor.Logger, holder *
 		reviewPatience = o.ReviewPatience
 	}
 
-	// resolve task model: CLI flag > config file > empty (use CLI default)
-	taskModel := req.Config.TaskModel
-	if o.TaskModel != "" {
-		taskModel = o.TaskModel
-	}
-
-	// resolve review model: CLI flag > config file > empty (falls back to task_model in processor)
-	reviewModel := req.Config.ReviewModel
-	if o.ReviewModel != "" {
-		reviewModel = o.ReviewModel
-	}
-
 	r := processor.New(processor.Config{
 		PlanFile:              req.PlanFile,
 		ProgressPath:          log.Path(),
@@ -980,8 +972,8 @@ func createRunner(req executePlanRequest, o opts, log processor.Logger, holder *
 		ExternalReviewToolSet: o.externalReviewToolSet,
 		FinalizeEnabled:       req.Config.FinalizeEnabled,
 		DefaultBranch:         req.BaseRef,
-		TaskModel:             taskModel,
-		ReviewModel:           reviewModel,
+		TaskModel:             resolveSpec(o.TaskModel, req.Config.TaskModel),
+		ReviewModel:           resolveReviewSpec(o, req.Config),
 		AppConfig:             req.Config,
 	}, log, holder)
 	if req.GitSvc != nil {
@@ -1068,6 +1060,58 @@ type codexBannerInfo struct {
 	maxDropped                bool // a claude-only "max" effort was requested and dropped
 }
 
+func resolveSpec(cliVal, cfgVal string) string {
+	if cliVal != "" {
+		return cliVal
+	}
+	return cfgVal
+}
+
+// runHeaderParams returns the user-set run parameters recorded in the progress
+// file header (and shown in the web dashboard). only explicitly configured
+// values are included: the review model is recorded only when set directly
+// (not its task_model fallback), while plan mode records the effective plan
+// spec since plan_model falls back to task_model by design.
+func runHeaderParams(o opts, cfg *config.Config, mode processor.Mode) progress.RunParams {
+	p := progress.RunParams{}
+	if cfg == nil {
+		return p
+	}
+	if cfg.Executor == config.ExecutorCodex {
+		p.Executor = config.ExecutorCodex
+	}
+	if mode == processor.ModePlan {
+		p.PlanModel = resolvePlanSpec(o, cfg)
+		return p
+	}
+	p.TaskModel = resolveSpec(o.TaskModel, cfg.TaskModel)
+	p.ReviewModel = resolveSpec(o.ReviewModel, cfg.ReviewModel)
+	return p
+}
+
+func resolvePlanSpec(o opts, cfg *config.Config) string {
+	if planSpec := resolveSpec(o.PlanModel, cfg.PlanModel); planSpec != "" {
+		return planSpec
+	}
+	return resolveSpec(o.TaskModel, cfg.TaskModel)
+}
+
+func resolveReviewSpec(o opts, cfg *config.Config) string {
+	if reviewSpec := resolveSpec(o.ReviewModel, cfg.ReviewModel); reviewSpec != "" {
+		return reviewSpec
+	}
+	return resolveSpec(o.TaskModel, cfg.TaskModel)
+}
+
+func codexBannerForSpec(spec string, cfg *config.Config) codexBannerInfo {
+	model, effort, maxDropped := processor.ResolveCodexModelEffort(spec, cfg.CodexModel, cfg.CodexReasoningEffort)
+	return codexBannerInfo{
+		taskModel: model, taskEffort: effort,
+		reviewModel: model, reviewEffort: effort,
+		maxDropped: maxDropped,
+	}
+}
+
 // codexModelBanner resolves the codex task and review model/effort for the startup
 // banner from the task/review model specs (--task-model / --review-model CLI flag >
 // task_model / review_model config) against codex_model / codex_reasoning_effort. it
@@ -1075,24 +1119,13 @@ type codexBannerInfo struct {
 // codex executors will actually receive. review fields equal the task fields unless a
 // distinct review spec is given.
 func codexModelBanner(o opts, cfg *config.Config) codexBannerInfo {
-	taskSpec := cfg.TaskModel
-	if o.TaskModel != "" {
-		taskSpec = o.TaskModel
-	}
-	reviewSpec := cfg.ReviewModel
-	if o.ReviewModel != "" {
-		reviewSpec = o.ReviewModel
-	}
-	taskModel, taskEffort, taskMax := processor.ResolveCodexModelEffort(taskSpec, cfg.CodexModel, cfg.CodexReasoningEffort)
-	info := codexBannerInfo{
-		taskModel: taskModel, taskEffort: taskEffort,
-		reviewModel: taskModel, reviewEffort: taskEffort,
-		maxDropped: taskMax,
-	}
+	taskSpec := resolveSpec(o.TaskModel, cfg.TaskModel)
+	info := codexBannerForSpec(taskSpec, cfg)
+	reviewSpec := resolveSpec(o.ReviewModel, cfg.ReviewModel)
 	if reviewSpec != "" {
-		reviewModel, reviewEffort, reviewMax := processor.ResolveCodexModelEffort(reviewSpec, cfg.CodexModel, cfg.CodexReasoningEffort)
-		info.reviewModel, info.reviewEffort = reviewModel, reviewEffort
-		info.maxDropped = info.maxDropped || reviewMax
+		reviewInfo := codexBannerForSpec(reviewSpec, cfg)
+		info.reviewModel, info.reviewEffort = reviewInfo.taskModel, reviewInfo.taskEffort
+		info.maxDropped = info.maxDropped || reviewInfo.maxDropped
 	}
 	return info
 }
@@ -1100,23 +1133,7 @@ func codexModelBanner(o opts, cfg *config.Config) codexBannerInfo {
 // codexPlanBanner resolves the codex model/effort for plan creation. plan_model
 // falls back to task_model, then to codex_model/codex_reasoning_effort defaults.
 func codexPlanBanner(o opts, cfg *config.Config) codexBannerInfo {
-	taskSpec := cfg.TaskModel
-	if o.TaskModel != "" {
-		taskSpec = o.TaskModel
-	}
-	planSpec := cfg.PlanModel
-	if o.PlanModel != "" {
-		planSpec = o.PlanModel
-	}
-	if planSpec == "" {
-		planSpec = taskSpec
-	}
-	planModel, planEffort, maxDropped := processor.ResolveCodexModelEffort(planSpec, cfg.CodexModel, cfg.CodexReasoningEffort)
-	return codexBannerInfo{
-		taskModel: planModel, taskEffort: planEffort,
-		reviewModel: planModel, reviewEffort: planEffort,
-		maxDropped: maxDropped,
-	}
+	return codexBannerForSpec(resolvePlanSpec(o, cfg), cfg)
 }
 
 // runPlanMode executes interactive plan creation mode.
@@ -1137,6 +1154,7 @@ func runPlanMode(ctx context.Context, o opts, req executePlanRequest, selector *
 		PlanDescription: o.PlanDescription,
 		Mode:            string(processor.ModePlan),
 		Branch:          branch,
+		Params:          runHeaderParams(o, req.Config, processor.ModePlan),
 		NoColor:         o.NoColor,
 	}, req.Colors, holder)
 	if err != nil {
@@ -1192,18 +1210,6 @@ func runPlanMode(ctx context.Context, o opts, req executePlanRequest, selector *
 	// record start time for finding the created plan
 	startTime := time.Now()
 
-	// create and configure runner
-	taskModel := req.Config.TaskModel
-	if o.TaskModel != "" {
-		taskModel = o.TaskModel
-	}
-	if req.Config.PlanModel != "" {
-		taskModel = req.Config.PlanModel
-	}
-	if o.PlanModel != "" {
-		taskModel = o.PlanModel
-	}
-
 	r := processor.New(processor.Config{
 		PlanDescription:  o.PlanDescription,
 		ProgressPath:     baseLog.Path(),
@@ -1213,7 +1219,7 @@ func runPlanMode(ctx context.Context, o opts, req executePlanRequest, selector *
 		NoColor:          o.NoColor,
 		IterationDelayMs: req.Config.IterationDelayMs,
 		DefaultBranch:    req.BaseRef,
-		TaskModel:        taskModel,
+		TaskModel:        resolvePlanSpec(o, req.Config),
 		AppConfig:        req.Config,
 	}, baseLog, holder)
 	r.SetInputCollector(collector)

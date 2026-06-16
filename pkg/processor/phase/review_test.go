@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -66,6 +67,28 @@ func TestReviewPhase_Loop_PatternMatchError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "boom")
 	assertLogContains(t, log, "detected")
+}
+
+func TestWrapExecutorError(t *testing.T) {
+	t.Run("nil error returns nil", func(t *testing.T) {
+		assert.NoError(t, wrapExecutorError(newScriptedTestPolicy(newMockLogger("")), nil, "claude"))
+	})
+
+	t.Run("pattern match wraps as pattern handling", func(t *testing.T) {
+		policy := newScriptedTestPolicy(newMockLogger(""))
+		patternErr := &executor.PatternMatchError{Pattern: "rate limit", HelpCmd: "usage"}
+		err := wrapExecutorError(policy, patternErr, "codex")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "codex pattern handling:")
+		assert.Contains(t, err.Error(), "rate limit")
+	})
+
+	t.Run("plain error wraps as execution", func(t *testing.T) {
+		err := wrapExecutorError(newScriptedTestPolicy(newMockLogger("")), errors.New("boom"), "claude")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "claude execution:")
+		assert.Contains(t, err.Error(), "boom")
+	})
 }
 
 func TestReviewPhase_Loop_NoCommitExit(t *testing.T) {
@@ -148,16 +171,18 @@ func TestReviewPhase_Loop_TimeoutContinues(t *testing.T) {
 	log := newMockLogger("progress.txt")
 	exec := newTaskPhaseMockExecutor(nil)
 	phase, _ := reviewPhaseFromRunner(t, reviewPhaseTestOpts{cfg: Config{MaxIterations: 50}, exec: exec, log: log})
-	phase.policy = newScriptedTestPolicy(log,
+	policy := newScriptedTestPolicy(log,
 		ExecutionResult{TimedOut: true},
 		ExecutionResult{Result: executor.Result{Output: "review done", Signal: status.ReviewDone}},
 	)
+	phase.policy = policy
 
 	err := phase.Loop(t.Context(), "")
 
 	require.NoError(t, err)
 	assert.Len(t, exec.RunCalls(), 2)
 	assertLogContains(t, log, "retrying review iteration")
+	assert.Equal(t, []time.Duration{retryBackoff}, policy.sleepCalls, "timeout retry waits the backoff once")
 }
 
 func TestReviewPhase_First_CodexTimeoutSurfacesAsError(t *testing.T) {

@@ -71,6 +71,14 @@ RUN ARCH=$(uname -m) && \
     chmod +x /usr/local/bin/opencode && \
     rtk --version && opencode --version
 
+# install latest fya (claude print-mode PTY wrapper), usable as an optional claude_command provider
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
+    TAG=$(wget -qO- https://api.github.com/repos/umputun/fya/releases/latest | jq -r .tag_name) && \
+    { [ -n "$TAG" ] && [ "$TAG" != "null" ]; } || { echo "error: could not resolve latest fya release"; exit 1; } && \
+    wget -qO- "https://github.com/umputun/fya/releases/download/${TAG}/fya_${TAG#v}_linux_${ARCH}.tar.gz" | \
+        tar -xz -C /usr/local/bin fya && \
+    fya --version >/dev/null || { echo "error: fya CLI not runnable"; exit 1; }
+
 # copy ralphex binary
 COPY --from=build /build/ralphex /srv/ralphex
 RUN chmod +x /srv/ralphex
