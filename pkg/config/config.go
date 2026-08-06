@@ -27,26 +27,27 @@ const (
 	codexReviewPromptFile  = "codex_review.txt"
 )
 
+// Executor mode constants for the Config.Executor field.
+// ExecutorClaude is the default — the empty string is intentional so that an
+// unset `executor` field in config (or no flag on the CLI) resolves to the
+// claude pipeline without users having to spell it out. ExecutorCodex is the
+// opt-in first-class --codex path.
+const (
+	ExecutorClaude = ""
+	ExecutorCodex  = "codex"
+)
+
 // Config holds all configuration settings for ralphex.
-// Fields ending in *Set track whether that field was explicitly set in config.
+// Fields ending in *Set mostly track whether that field was explicitly set in config.
 // This allows distinguishing explicit false/0 from "not set", enabling proper
 // merge behavior where local config can override global config with zero values.
-//
-// *Set fields:
-//   - ClaudeArgsSet: tracks if claude_args was explicitly overridden at runtime
-//   - CodexEnabledSet: tracks if codex_enabled was explicitly set
-//   - CodexTimeoutMsSet: tracks if codex_timeout_ms was explicitly set
-//   - IterationDelayMsSet: tracks if iteration_delay_ms was explicitly set
-//   - TaskRetryCountSet: tracks if task_retry_count was explicitly set
-//   - FinalizeEnabledSet: tracks if finalize_enabled was explicitly set
-//   - WorktreeEnabledSet: tracks if use_worktree was explicitly set
-//   - MaxIterationsSet: tracks if max_iterations was explicitly set
-//   - WaitOnLimitSet: tracks if wait_on_limit was explicitly set
-//   - SessionTimeoutSet: tracks if session_timeout was explicitly set
+// Runtime-only exceptions, such as ClaudeArgsSet, are documented inline.
+// The inline field comments are the source of truth for which *Set sentinels exist.
 type Config struct {
 	ClaudeCommand string `json:"claude_command"`
 	ClaudeArgs    string `json:"claude_args"`
 	ClaudeArgsSet bool   `json:"-"`            // tracks runtime overrides, including an explicit empty --claude-args=
+	PlanModel     string `json:"plan_model"`   // model[:effort] spec for plan creation (falls back to TaskModel)
 	TaskModel     string `json:"task_model"`   // model[:effort] spec for task execution (e.g., "opus", "opus:high", ":medium")
 	ReviewModel   string `json:"review_model"` // model[:effort] spec for review phases (falls back to TaskModel)
 
@@ -58,9 +59,11 @@ type Config struct {
 	CodexTimeoutMs       int    `json:"codex_timeout_ms"`
 	CodexTimeoutMsSet    bool   `json:"-"` // tracks if codex_timeout_ms was explicitly set in config
 	CodexSandbox         string `json:"codex_sandbox"`
+	CodexSandboxSet      bool   `json:"-"` // tracks if codex_sandbox was explicitly set outside embedded defaults
 
-	ExternalReviewTool string `json:"external_review_tool"` // "codex", "custom", or "none"
-	CustomReviewScript string `json:"custom_review_script"` // path to custom review script
+	ExternalReviewTool    string `json:"external_review_tool"` // "codex", "custom", or "none"
+	ExternalReviewToolSet bool   `json:"-"`                    // tracks if external_review_tool was explicitly set in user config (not embedded default)
+	CustomReviewScript    string `json:"custom_review_script"` // path to custom review script
 
 	IterationDelayMs      int  `json:"iteration_delay_ms"`
 	IterationDelayMsSet   bool `json:"-"` // tracks if iteration_delay_ms was explicitly set in config
@@ -76,6 +79,9 @@ type Config struct {
 
 	PreserveAnthropicAPIKey bool `json:"preserve_anthropic_api_key"` // when true, ANTHROPIC_API_KEY is passed through to the claude child process
 
+	Executor     string `json:"executor"`       // "" (= claude, default) or ExecutorCodex
+	PassClaudeMd bool   `json:"pass_claude_md"` // when true, codex reads project CLAUDE.md via project_doc_fallback_filenames; user-level ~/.claude/CLAUDE.md is not auto-passed (a one-time setup hint is printed)
+
 	MovePlanOnCompletion bool `json:"move_plan_on_completion"`
 
 	WorktreeEnabled    bool `json:"worktree_enabled"`
@@ -87,21 +93,20 @@ type Config struct {
 	VcsCommand    string   `json:"vcs_command"`    // custom VCS command (default: "git")
 	CommitTrailer string   `json:"commit_trailer"` // trailer line to append to all commits
 
-	// error patterns to detect in executor output (e.g., rate limit messages)
-	ClaudeErrorPatterns []string `json:"claude_error_patterns"`
-	CodexErrorPatterns  []string `json:"codex_error_patterns"`
+	ClaudeErrorPatterns []string `json:"claude_error_patterns"` // patterns to detect in claude output (e.g., rate limit messages)
+	CodexErrorPatterns  []string `json:"codex_error_patterns"`  // patterns to detect in codex output (e.g., rate limit messages)
+	ClaudeLimitPatterns []string `json:"claude_limit_patterns"` // patterns to detect rate limits in claude output (for wait+retry)
+	CodexLimitPatterns  []string `json:"codex_limit_patterns"`  // patterns to detect rate limits in codex output (for wait+retry)
+	ClaudeRetryPatterns []string `json:"claude_retry_patterns"` // transient claude/fya errors to retry like timeouts
 
-	// limit patterns for wait+retry behavior (overlap with error patterns is intentional)
-	ClaudeLimitPatterns []string      `json:"claude_limit_patterns"`
-	CodexLimitPatterns  []string      `json:"codex_limit_patterns"`
-	WaitOnLimit         time.Duration `json:"wait_on_limit"`
-	WaitOnLimitSet      bool          `json:"-"` // tracks if wait_on_limit was explicitly set in config
+	WaitOnLimit    time.Duration `json:"wait_on_limit"`
+	WaitOnLimitSet bool          `json:"-"` // tracks if wait_on_limit was explicitly set in config
 
-	// session timeout for claude sessions (kills hanging sessions)
+	// session timeout for configured executor sessions (external review in Claude mode is excluded)
 	SessionTimeout    time.Duration `json:"session_timeout"`
 	SessionTimeoutSet bool          `json:"-"` // tracks if session_timeout was explicitly set in config
 
-	// idle timeout for claude sessions (kills session after no output for this duration)
+	// idle timeout for claude and codex executor sessions
 	IdleTimeout    time.Duration `json:"idle_timeout"`
 	IdleTimeoutSet bool          `json:"-"` // tracks if idle_timeout was explicitly set in config
 
@@ -284,6 +289,7 @@ func loadConfigFromDirs(globalDir, localDir string) (*Config, error) {
 	c := &Config{
 		ClaudeCommand:           values.ClaudeCommand,
 		ClaudeArgs:              values.ClaudeArgs,
+		PlanModel:               values.PlanModel,
 		TaskModel:               values.TaskModel,
 		ReviewModel:             values.ReviewModel,
 		CodexEnabled:            values.CodexEnabled,
@@ -294,7 +300,9 @@ func loadConfigFromDirs(globalDir, localDir string) (*Config, error) {
 		CodexTimeoutMs:          values.CodexTimeoutMs,
 		CodexTimeoutMsSet:       values.CodexTimeoutMsSet,
 		CodexSandbox:            values.CodexSandbox,
+		CodexSandboxSet:         values.CodexSandboxSet,
 		ExternalReviewTool:      values.ExternalReviewTool,
+		ExternalReviewToolSet:   values.ExternalReviewToolSet,
 		CustomReviewScript:      values.CustomReviewScript,
 		IterationDelayMs:        values.IterationDelayMs,
 		IterationDelayMsSet:     values.IterationDelayMsSet,
@@ -307,6 +315,8 @@ func loadConfigFromDirs(globalDir, localDir string) (*Config, error) {
 		FinalizeEnabled:         values.FinalizeEnabled,
 		FinalizeEnabledSet:      values.FinalizeEnabledSet,
 		PreserveAnthropicAPIKey: values.PreserveAnthropicAPIKey,
+		Executor:                values.Executor,
+		PassClaudeMd:            values.PassClaudeMd,
 		MovePlanOnCompletion:    values.MovePlanOnCompletion,
 		WorktreeEnabled:         values.WorktreeEnabled,
 		WorktreeEnabledSet:      values.WorktreeEnabledSet,
@@ -319,6 +329,7 @@ func loadConfigFromDirs(globalDir, localDir string) (*Config, error) {
 		CodexErrorPatterns:      values.CodexErrorPatterns,
 		ClaudeLimitPatterns:     values.ClaudeLimitPatterns,
 		CodexLimitPatterns:      values.CodexLimitPatterns,
+		ClaudeRetryPatterns:     values.ClaudeRetryPatterns,
 		WaitOnLimit:             values.WaitOnLimit,
 		WaitOnLimitSet:          values.WaitOnLimitSet,
 		SessionTimeout:          values.SessionTimeout,
@@ -386,4 +397,16 @@ func DefaultConfigDir() string {
 // returns empty string if no local config was used.
 func (c *Config) LocalDir() string {
 	return c.localDir
+}
+
+// CodexExecutorSandbox returns the sandbox mode to use when codex is the active
+// executor (--codex mode). Defaults to "danger-full-access" because the codex
+// executor needs to write git metadata and commit; an explicit codex_sandbox in
+// user config wins. Distinct from the raw CodexSandbox field, which is what the
+// external-review codex (claude mode) reads directly.
+func (c *Config) CodexExecutorSandbox() string {
+	if c == nil || !c.CodexSandboxSet || c.CodexSandbox == "" {
+		return "danger-full-access"
+	}
+	return c.CodexSandbox
 }

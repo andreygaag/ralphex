@@ -7,7 +7,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -21,8 +20,15 @@ import (
 //	Plan: path/to/plan.md
 //	Branch: feature-branch
 //	Mode: full
+//	Executor: codex
+//	Plan model: opus:high
+//	Task model: gpt-5.5:high
+//	Review model: gpt-5.5:low
 //	Started: 2026-01-22 10:30:00
 //	------------------------------------------------------------
+//
+// the Executor and model lines are optional — they appear only when the
+// corresponding parameter was set for the run.
 //
 // the second return value reports whether the terminating separator line was
 // observed, which means the header is fully written. during a truncate+rewrite
@@ -53,18 +59,7 @@ func ParseProgressHeader(path string) (meta SessionMetadata, complete bool, err 
 
 		// parse key-value pairs (process line before checking error,
 		// as ReadString may return partial data alongside an error)
-		if val, found := strings.CutPrefix(line, "Plan: "); found {
-			meta.PlanPath = val
-		} else if val, found := strings.CutPrefix(line, "Branch: "); found {
-			meta.Branch = val
-		} else if val, found := strings.CutPrefix(line, "Mode: "); found {
-			meta.Mode = val
-		} else if val, found := strings.CutPrefix(line, "Started: "); found {
-			// header timestamps are written in local time without a zone offset
-			if t, parseErr := time.ParseInLocation("2006-01-02 15:04:05", val, time.Local); parseErr == nil {
-				meta.StartTime = t
-			}
-		}
+		parseHeaderField(&meta, line)
 
 		if readErr != nil {
 			if !errors.Is(readErr, io.EOF) {
@@ -75,6 +70,35 @@ func ParseProgressHeader(path string) (meta SessionMetadata, complete bool, err 
 	}
 
 	return meta, complete, nil
+}
+
+// parseHeaderField applies a single header key-value line to meta.
+// unknown lines are ignored.
+func parseHeaderField(meta *SessionMetadata, line string) {
+	fields := []struct {
+		prefix string
+		dst    *string
+	}{
+		{"Plan: ", &meta.PlanPath},
+		{"Branch: ", &meta.Branch},
+		{"Mode: ", &meta.Mode},
+		{"Executor: ", &meta.Executor},
+		{"Plan model: ", &meta.PlanModel},
+		{"Task model: ", &meta.TaskModel},
+		{"Review model: ", &meta.ReviewModel},
+	}
+	for _, f := range fields {
+		if val, found := strings.CutPrefix(line, f.prefix); found {
+			*f.dst = val
+			return
+		}
+	}
+	if val, found := strings.CutPrefix(line, "Started: "); found {
+		// header timestamps are written in local time without a zone offset
+		if t, parseErr := time.ParseInLocation("2006-01-02 15:04:05", val, time.Local); parseErr == nil {
+			meta.StartTime = t
+		}
+	}
 }
 
 // loadProgressFileIntoSession reads a progress file and publishes events to the session's SSE server.
@@ -93,6 +117,7 @@ func (m *SessionManager) loadProgressFileIntoSession(path string, session *Sessi
 	inHeader := true
 	phase := status.PhaseTask
 	var pendingSection string // section header waiting for first timestamped event
+	var currentTask int       // active task number for task_end boundary events
 	var bytesRead int64
 
 	for {
@@ -115,7 +140,7 @@ func (m *SessionManager) loadProgressFileIntoSession(path string, session *Sessi
 		if line != "" {
 			var parsed ParsedLine
 			parsed, inHeader = parseProgressLine(line, inHeader)
-			phase, pendingSection = m.processProgressLine(session, parsed, phase, pendingSection)
+			phase, pendingSection, currentTask = m.processProgressLine(session, parsed, phase, pendingSection, currentTask)
 		}
 
 		if readErr != nil {
@@ -124,89 +149,71 @@ func (m *SessionManager) loadProgressFileIntoSession(path string, session *Sessi
 	}
 
 	if pendingSection != "" {
-		m.emitPendingSection(session, pendingSection, phase, time.Now())
+		var events []Event
+		events, currentTask = buildPendingSectionEvents(pendingSection, phase, time.Now(), currentTask)
+		m.publishEvents(session, events)
 	}
 
 	session.setLastOffset(bytesRead)
 	// record the phase the parser ended on so a later Reactivate resumes with
 	// the correct phase rather than the tailer's default (PhaseTask).
 	session.setLastPhase(phase)
+	// record the active task so a later Reactivate emits its task_end when the
+	// next task iteration or phase transition arrives.
+	session.setLastTask(currentTask)
 }
 
 // processProgressLine handles a single parsed progress line,
-// updating phase and pendingSection state and publishing events as needed.
+// updating phase, pendingSection, and currentTask state and publishing events as needed.
 func (m *SessionManager) processProgressLine(session *Session, parsed ParsedLine,
-	phase status.Phase, pendingSection string) (status.Phase, string) {
+	phase status.Phase, pendingSection string, currentTask int) (status.Phase, string, int) {
 	switch parsed.Type {
 	case ParsedLineSkip:
-		return phase, pendingSection
+		return phase, pendingSection, currentTask
 	case ParsedLineSection:
 		if pendingSection != "" {
-			m.emitPendingSection(session, pendingSection, phase, time.Now())
+			var events []Event
+			events, currentTask = buildPendingSectionEvents(pendingSection, phase, time.Now(), currentTask)
+			m.publishEvents(session, events)
 		}
 		phase = parsed.Phase
 		// defer emitting section until we see a timestamped event
-		return phase, parsed.Section
+		return phase, parsed.Section, currentTask
 	case ParsedLineTimestamp:
 		// emit pending section with this event's timestamp (for accurate durations)
 		if pendingSection != "" {
-			m.emitPendingSection(session, pendingSection, phase, parsed.Timestamp)
+			var events []Event
+			events, currentTask = buildPendingSectionEvents(pendingSection, phase, parsed.Timestamp, currentTask)
+			m.publishEvents(session, events)
 			pendingSection = ""
 		}
-		event := Event{
-			Type:      parsed.EventType,
-			Phase:     phase,
-			Text:      parsed.Text,
-			Timestamp: parsed.Timestamp,
-			Signal:    parsed.Signal,
-		}
+		// close the final task in --tasks-only runs, which end on COMPLETED with
+		// no following section to trigger the task_end.
+		var endEvents []Event
+		endEvents, currentTask = taskEndOnCompletion(parsed, currentTask)
+		m.publishEvents(session, endEvents)
+		event := eventFromParsed(parsed, phase)
 		if event.Type == EventTypeOutput {
 			if stats, ok := parseDiffStats(event.Text); ok {
 				session.SetDiffStats(stats)
 			}
 		}
-		_ = session.Publish(event)
+		m.publishEvent(session, event)
 	case ParsedLinePlain:
-		_ = session.Publish(Event{
-			Type:      EventTypeOutput,
-			Phase:     phase,
-			Text:      parsed.Text,
-			Timestamp: time.Now(),
-		})
+		m.publishEvent(session, eventFromParsed(parsed, phase))
 	}
-	return phase, pendingSection
+	return phase, pendingSection, currentTask
 }
 
-// emitPendingSection publishes section and task_start events for a pending section.
-// task_start is emitted before section for task iteration sections.
-func (m *SessionManager) emitPendingSection(session *Session, sectionName string, phase status.Phase, ts time.Time) {
-	// emit task_start event for task iteration sections
-	if matches := taskIterationRegex.FindStringSubmatch(sectionName); matches != nil {
-		taskNum, err := strconv.Atoi(matches[1])
-		if err != nil {
-			// log parse error but continue - section will still be emitted
-			log.Printf("[WARN] failed to parse task number from section %q: %v", sectionName, err)
-		} else {
-			if err := session.Publish(Event{
-				Type:      EventTypeTaskStart,
-				Phase:     phase,
-				TaskNum:   taskNum,
-				Text:      sectionName,
-				Timestamp: ts,
-			}); err != nil {
-				log.Printf("[WARN] failed to publish task_start event: %v", err)
-			}
-		}
+func (m *SessionManager) publishEvents(session *Session, events []Event) {
+	for _, event := range events {
+		m.publishEvent(session, event)
 	}
+}
 
-	if err := session.Publish(Event{
-		Type:      EventTypeSection,
-		Phase:     phase,
-		Section:   sectionName,
-		Text:      sectionName,
-		Timestamp: ts,
-	}); err != nil {
-		log.Printf("[WARN] failed to publish section event: %v", err)
+func (m *SessionManager) publishEvent(session *Session, event Event) {
+	if err := session.Publish(event); err != nil {
+		log.Printf("[WARN] failed to publish %s event: %v", event.Type, err)
 	}
 }
 

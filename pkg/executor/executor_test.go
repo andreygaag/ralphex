@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -247,6 +248,116 @@ func TestClaudeExecutor_parseStream_withHandler(t *testing.T) {
 	assert.Equal(t, []string{"chunk1", "chunk2"}, chunks)
 }
 
+func TestClaudeExecutor_subagentLine(t *testing.T) {
+	e := &ClaudeExecutor{}
+
+	tests := []struct {
+		name         string
+		line         string
+		want         string
+		wantThrottle bool
+	}{
+		{
+			name:         "task_progress is a throttled step (no agent name, no tool name)",
+			line:         `{"type":"system","subtype":"task_progress","description":"Running Check file size","subagent_type":"general-purpose","last_tool_name":"Bash"}`,
+			want:         "  Running Check file size\n",
+			wantThrottle: true,
+		},
+		{
+			name: "task_started title is unthrottled",
+			line: `{"type":"system","subtype":"task_started","subagent_type":"qa-expert","description":"QA review of branch"}`,
+			want: "  QA review of branch\n",
+		},
+		{name: "task_started without description skipped", line: `{"type":"system","subtype":"task_started","subagent_type":"general-purpose"}`, want: ""},
+		{name: "task_progress empty description skipped", line: `{"type":"system","subtype":"task_progress"}`, want: ""},
+		{name: "task_updated completion not surfaced", line: `{"type":"system","subtype":"task_updated","task_id":"t1","patch":{"status":"completed"}}`, want: ""},
+		{name: "system init not surfaced", line: `{"type":"system","subtype":"init"}`, want: ""},
+		{name: "assistant event not a task line", line: `{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}`, want: ""},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var event streamEvent
+			require.NoError(t, json.Unmarshal([]byte(tc.line), &event))
+			line, throttle := e.subagentLine(&event)
+			assert.Equal(t, tc.want, line)
+			assert.Equal(t, tc.wantThrottle, throttle)
+		})
+	}
+}
+
+func TestClaudeExecutor_parseStream_surfacesSubagentProgress(t *testing.T) {
+	// subagent system events carry no text block: they must reach OutputHandler as
+	// heartbeat lines (the description only — no agent name, no tool name) but must
+	// NOT pollute the accumulated output or recent-text.
+	input := `{"type":"assistant","message":{"content":[{"type":"text","text":"launching agents"}]}}
+{"type":"system","subtype":"task_started","subagent_type":"general-purpose","description":"QA review of branch"}
+{"type":"system","subtype":"task_progress","description":"Running tests","subagent_type":"general-purpose","last_tool_name":"Bash"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"finished reply"}]}}`
+
+	var chunks []string
+	base := time.Unix(1000, 0)
+	e := &ClaudeExecutor{
+		OutputHandler: func(text string) { chunks = append(chunks, text) },
+		nowFn:         func() time.Time { return base },
+	}
+	result := e.parseStream(context.Background(), strings.NewReader(input), func() {})
+
+	// accumulated output holds only the model's own text, not the heartbeat lines
+	assert.Equal(t, "launchingagentsfinishedreply", strings.ReplaceAll(result.Output, " ", ""))
+	assert.NotContains(t, result.Output, "Running tests")
+	assert.NotContains(t, result.RecentText, "Running tests")
+	// heartbeats forwarded live for visibility: title and step, description only
+	assert.Contains(t, chunks, "  QA review of branch\n")
+	assert.Contains(t, chunks, "  Running tests\n")
+}
+
+func TestClaudeExecutor_parseStream_throttlesSubagentProgress(t *testing.T) {
+	// four subagent heartbeats: with the clock advancing 2s, 2s, then past the
+	// interval, only the first and the last (after the window reopens) are forwarded.
+	input := `{"type":"system","subtype":"task_progress","description":"step 1","subagent_type":"general-purpose"}
+{"type":"system","subtype":"task_progress","description":"step 2","subagent_type":"general-purpose"}
+{"type":"system","subtype":"task_progress","description":"step 3","subagent_type":"general-purpose"}
+{"type":"system","subtype":"task_progress","description":"step 4","subagent_type":"general-purpose"}`
+
+	base := time.Unix(2000, 0)
+	times := []time.Time{base, base.Add(2 * time.Second), base.Add(4 * time.Second), base.Add(subagentProgressInterval + time.Second)}
+	var i int
+	var chunks []string
+	e := &ClaudeExecutor{
+		OutputHandler: func(text string) { chunks = append(chunks, text) },
+		nowFn:         func() time.Time { t := times[i%len(times)]; i++; return t },
+	}
+	e.parseStream(context.Background(), strings.NewReader(input), func() {})
+
+	assert.Equal(t, []string{"  step 1\n", "  step 4\n"}, chunks,
+		"only the first heartbeat and the one after the window reopens should pass")
+}
+
+func TestClaudeExecutor_parseStream_taskStartedNotThrottled(t *testing.T) {
+	// task_started titles (the subagent's task, no tool step) are always shown, even
+	// back-to-back within the throttle window; only per-tool-step task_progress is
+	// throttled. clock never advances so every task_progress after the first is
+	// throttled away, but both titles must still appear.
+	input := `{"type":"system","subtype":"task_started","subagent_type":"qa-expert","description":"QA review of branch"}
+{"type":"system","subtype":"task_progress","description":"step 1","subagent_type":"qa-expert","last_tool_name":"Bash"}
+{"type":"system","subtype":"task_started","subagent_type":"go-test-expert","description":"test review of branch"}
+{"type":"system","subtype":"task_progress","description":"step 2","subagent_type":"go-test-expert","last_tool_name":"Read"}`
+
+	base := time.Unix(3000, 0)
+	var chunks []string
+	e := &ClaudeExecutor{
+		OutputHandler: func(text string) { chunks = append(chunks, text) },
+		nowFn:         func() time.Time { return base },
+	}
+	e.parseStream(context.Background(), strings.NewReader(input), func() {})
+
+	assert.Contains(t, chunks, "  QA review of branch\n", "task_started title always shown")
+	assert.Contains(t, chunks, "  test review of branch\n", "second title shown despite the throttle window")
+	assert.Contains(t, chunks, "  step 1\n", "first task_progress opens the window")
+	assert.NotContains(t, chunks, "  step 2\n", "later task_progress in the same window is throttled")
+}
+
 func TestClaudeExecutor_parseStream_withDebug(t *testing.T) {
 	// non-json lines should be printed as-is (with debug message)
 	input := "not json\n" + `{"type":"content_block_delta","delta":{"type":"text_delta","text":"valid"}}`
@@ -354,6 +465,26 @@ func TestDetectSignal(t *testing.T) {
 		{"review complete " + status.ReviewDone, status.ReviewDone},
 		{status.CodexDone + " analysis done", status.CodexDone},
 		{"plan complete " + status.PlanReady, status.PlanReady},
+		{`I have inspected the codebase and confirmed all tasks are done.
+The plan file shows every checkbox marked, tests pass locally, and the linter is clean.
+
+<<<RALPHEX:ALL_TASKS_DONE>>>`, status.Completed},
+		{`Round 1 review summary follows.
+
+The implementation looks complete. Tests cover the new behavior.
+
+<<<RALPHEX:REVIEW_DONE>>>
+
+Additional thoughts: future work could explore caching.`, status.ReviewDone},
+		{`External review iteration finished.
+<<<RALPHEX:CODEX_REVIEW_DONE>>>
+Note: a minor formatting preference was noted but not flagged.`, status.CodexDone},
+		{`Attempted to run go test ./... but encountered a compilation error.
+
+<<<RALPHEX:TASK_FAILED>>>`, status.Failed},
+		{`Plan file written to docs/plans/20260514-feature.md.
+
+<<<RALPHEX:PLAN_READY>>>`, status.PlanReady},
 		{"no signal here", ""},
 	}
 
@@ -659,6 +790,10 @@ func TestPatternMatchError_Error(t *testing.T) {
 	assert.Equal(t, `detected error pattern: "rate limit exceeded"`, err.Error())
 }
 
+// enumeratedAPIErrorCodes mirrors the API Error codes in the default claude_error_patterns (#419):
+// specific hard-error codes, not a bare "API Error:" substring that would match narrated "API error:" prose.
+var enumeratedAPIErrorCodes = []string{"API Error: 400", "API Error: 401", "API Error: 403", "API Error: 404", "API Error: 413", "API Error: 429", "API Error: 500"}
+
 func TestMatchPattern(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -680,6 +815,15 @@ func TestMatchPattern(t *testing.T) {
 		{name: "multiline output", output: "line1\nYou've hit your limit\nline3", patterns: []string{"hit your limit"}, want: "hit your limit"},
 		{name: "api error 500", output: `API Error: 500 {"type":"error","error":{"type":"api_error","message":"Internal server error"}}`, patterns: []string{"API Error:"}, want: "API Error:"},
 		{name: "not logged in", output: "Not logged in · Please run /login", patterns: []string{"Not logged in"}, want: "Not logged in"},
+		// #419: enumerated API Error codes must not match narrated "API error:" prose (case-insensitive)
+		{name: "narrated api error prose not matched by enumerated codes",
+			output:   `isExpectedAuthMessage matching ("API error: Unauthorized Error", "Unauthorized Error")`,
+			patterns: enumeratedAPIErrorCodes, want: ""},
+		{name: "genuine api error 500 matched by enumerated code",
+			output:   `API Error: 500 {"type":"error"}`,
+			patterns: enumeratedAPIErrorCodes, want: "API Error: 500"},
+		{name: "genuine api error 401 matched by enumerated code",
+			output: "API Error: 401 Unauthorized", patterns: enumeratedAPIErrorCodes, want: "API Error: 401"},
 	}
 
 	for _, tc := range tests {
@@ -859,6 +1003,102 @@ func TestClaudeExecutor_Run_ErrorPattern_WithSignal(t *testing.T) {
 func TestLimitPatternError_Error(t *testing.T) {
 	err := &LimitPatternError{Pattern: "You've hit your limit", HelpCmd: "claude /usage"}
 	assert.Equal(t, `detected limit pattern: "You've hit your limit"`, err.Error())
+}
+
+func TestRetryPatternError_Error(t *testing.T) {
+	err := &RetryPatternError{Pattern: "FYA_TRANSIENT_TIMEOUT"}
+	assert.Equal(t, `detected retry pattern: "FYA_TRANSIENT_TIMEOUT"`, err.Error())
+}
+
+func TestClaudeExecutor_Run_DetectsRetryPatternFromNonJSONLine(t *testing.T) {
+	mock := &mocks.CommandRunnerMock{
+		RunFunc: func(_ context.Context, _ string, _ ...string) (io.Reader, func() error, error) {
+			out := "2026/06/02 13:18:04.138 [ERROR] run turn: turn canceled: " +
+				"context deadline exceeded: FYA_TRANSIENT_TIMEOUT: claude turn did not complete before fya turn timeout\n"
+			return strings.NewReader(out), func() error { return errors.New("exit status 1") }, nil
+		},
+	}
+	e := &ClaudeExecutor{cmdRunner: mock, RetryPatterns: []string{"FYA_TRANSIENT_TIMEOUT"}}
+
+	result := e.Run(context.Background(), "test prompt")
+
+	var retryErr *RetryPatternError
+	require.ErrorAs(t, result.Error, &retryErr)
+	assert.Equal(t, "FYA_TRANSIENT_TIMEOUT", retryErr.Pattern)
+	assert.Contains(t, result.Output, "FYA_TRANSIENT_TIMEOUT")
+}
+
+func TestClaudeExecutor_Run_RetryPatternTakesPriorityOverLimitAndError(t *testing.T) {
+	// when recent text matches retry, limit, and error patterns at once, retry wins (highest priority)
+	jsonStream := `{"type":"content_block_delta","delta":{"type":"text_delta",` +
+		`"text":"FYA_TRANSIENT_TIMEOUT and You've hit your limit and API Error: 500"}}`
+	mock := &mocks.CommandRunnerMock{
+		RunFunc: func(_ context.Context, _ string, _ ...string) (io.Reader, func() error, error) {
+			return strings.NewReader(jsonStream), func() error { return nil }, nil
+		},
+	}
+	e := &ClaudeExecutor{
+		cmdRunner:     mock,
+		RetryPatterns: []string{"FYA_TRANSIENT_TIMEOUT"},
+		LimitPatterns: []string{"You've hit your limit"},
+		ErrorPatterns: []string{"API Error:"},
+	}
+
+	result := e.Run(context.Background(), "test prompt")
+
+	var retryErr *RetryPatternError
+	require.ErrorAs(t, result.Error, &retryErr, "retry pattern must win over limit and error patterns")
+	assert.Equal(t, "FYA_TRANSIENT_TIMEOUT", retryErr.Pattern)
+}
+
+func TestClaudeExecutor_Run_RetryPatternSkippedWhenSignalPresent(t *testing.T) {
+	// a stray retry marker must not discard a completed run: when claude emits a completion
+	// signal, retry detection is skipped so the signal survives instead of forcing a re-run.
+	jsonStream := `{"type":"content_block_delta","delta":{"type":"text_delta",` +
+		`"text":"done FYA_TRANSIENT_TIMEOUT <<<RALPHEX:ALL_TASKS_DONE>>>"}}`
+	mock := &mocks.CommandRunnerMock{
+		RunFunc: func(_ context.Context, _ string, _ ...string) (io.Reader, func() error, error) {
+			return strings.NewReader(jsonStream), func() error { return nil }, nil
+		},
+	}
+	e := &ClaudeExecutor{cmdRunner: mock, RetryPatterns: []string{"FYA_TRANSIENT_TIMEOUT"}}
+
+	result := e.Run(context.Background(), "test prompt")
+
+	require.NoError(t, result.Error, "retry pattern must not fire when a completion signal is present")
+	assert.Equal(t, status.Completed, result.Signal, "completion signal must survive")
+}
+
+func TestClaudeExecutor_Run_IdleTimeoutDetectsRetryPattern(t *testing.T) {
+	// when idle timeout fires after a transient retry marker, the retry pattern should be detected
+	// instead of silently returning an idle timeout, so the phase retries the session.
+	pr, pw := io.Pipe()
+
+	mock := &mocks.CommandRunnerMock{
+		RunFunc: func(ctx context.Context, _ string, _ ...string) (io.Reader, func() error, error) {
+			go func() {
+				defer pw.Close()
+				fmt.Fprintln(pw, `{"type":"content_block_delta","delta":{"type":"text_delta","text":"FYA_TRANSIENT_TIMEOUT"}}`)
+				<-ctx.Done()
+			}()
+			return pr, func() error {
+				<-ctx.Done()
+				return errors.New("signal: killed")
+			}, nil
+		},
+	}
+
+	e := &ClaudeExecutor{
+		cmdRunner:     mock,
+		IdleTimeout:   100 * time.Millisecond,
+		RetryPatterns: []string{"FYA_TRANSIENT_TIMEOUT"},
+	}
+	result := e.Run(context.Background(), "test prompt")
+
+	var retryErr *RetryPatternError
+	require.ErrorAs(t, result.Error, &retryErr, "should return RetryPatternError")
+	assert.Equal(t, "FYA_TRANSIENT_TIMEOUT", retryErr.Pattern)
+	assert.False(t, result.IdleTimedOut, "IdleTimedOut should not be set when pattern matched")
 }
 
 func TestClaudeExecutor_Run_IdleTimeoutFires(t *testing.T) {
