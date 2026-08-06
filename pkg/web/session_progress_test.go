@@ -1,6 +1,8 @@
 package web
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +39,37 @@ Started: 2026-01-22 10:30:00
 		assert.Equal(t, "feature-branch", meta.Branch)
 		assert.Equal(t, "full", meta.Mode)
 		assert.Equal(t, time.Date(2026, 1, 22, 10, 30, 0, 0, time.Local), meta.StartTime)
+		assert.Empty(t, meta.Executor, "executor line absent → empty")
+		assert.Empty(t, meta.TaskModel)
+		assert.Empty(t, meta.ReviewModel)
+	})
+
+	t.Run("parses optional executor and model fields", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "progress-test.txt")
+
+		content := `# Ralphex Progress Log
+Plan: docs/plans/my-plan.md
+Branch: feature-branch
+Mode: full
+Executor: codex
+Plan model: opus:high
+Task model: gpt-5.5:high
+Review model: gpt-5.5:low
+Started: 2026-01-22 10:30:00
+------------------------------------------------------------
+`
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+		meta, complete, err := ParseProgressHeader(path)
+		require.NoError(t, err)
+		assert.True(t, complete)
+
+		assert.Equal(t, "codex", meta.Executor)
+		assert.Equal(t, "opus:high", meta.PlanModel)
+		assert.Equal(t, "gpt-5.5:high", meta.TaskModel)
+		assert.Equal(t, "gpt-5.5:low", meta.ReviewModel)
+		assert.Equal(t, "docs/plans/my-plan.md", meta.PlanPath, "Plan model line must not shadow Plan line")
 	})
 
 	t.Run("handles review-only mode", func(t *testing.T) {
@@ -169,6 +202,169 @@ Started: 2026-01-22 10:00:00
 
 		// should not panic
 		m.loadProgressFileIntoSession(path, session)
+	})
+
+	t.Run("emits plain line before pending section", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "progress-plain-after-section.txt")
+
+		content := `# Ralphex Progress Log
+Plan: docs/plan.md
+Branch: main
+Mode: full
+Started: 2026-01-22 10:00:00
+------------------------------------------------------------
+
+--- Review ---
+plain review output
+`
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+		m := NewSessionManager()
+		defer m.Close()
+		session := NewSession("test-plain-after-section", path)
+		defer session.Close()
+
+		require.NoError(t, session.Publish(NewOutputEvent(status.PhaseTask, "seed")))
+		rawEvents, cleanup := subscribeSSEEvents(t, session)
+		defer cleanup()
+		_ = drainChannel(rawEvents, 50*time.Millisecond)
+
+		m.loadProgressFileIntoSession(path, session)
+
+		got := drainChannel(rawEvents, 50*time.Millisecond)
+		require.Len(t, got, 2)
+
+		var first, second Event
+		require.NoError(t, json.Unmarshal([]byte(got[0]), &first))
+		require.NoError(t, json.Unmarshal([]byte(got[1]), &second))
+		assert.Equal(t, EventTypeOutput, first.Type)
+		assert.Equal(t, "plain review output", first.Text)
+		assert.Equal(t, EventTypeSection, second.Type)
+		assert.Equal(t, "Review", second.Section)
+	})
+
+	t.Run("emits task end boundaries for finished tasks", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "progress-task-boundaries.txt")
+
+		content := `# Ralphex Progress Log
+Plan: docs/plan.md
+Branch: main
+Mode: full
+Started: 2026-01-22 10:00:00
+------------------------------------------------------------
+
+--- task iteration 1 ---
+[26-01-22 10:00:01] task one output
+--- task iteration 2 ---
+[26-01-22 10:00:02] task two output
+--- review iteration 1 ---
+[26-01-22 10:00:03] review output
+`
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+		m := NewSessionManager()
+		defer m.Close()
+		session := NewSession("test-task-boundaries", path)
+		defer session.Close()
+
+		require.NoError(t, session.Publish(NewOutputEvent(status.PhaseTask, "seed")))
+		rawEvents, cleanup := subscribeSSEEvents(t, session)
+		defer cleanup()
+		_ = drainChannel(rawEvents, 50*time.Millisecond)
+
+		m.loadProgressFileIntoSession(path, session)
+
+		got := drainChannel(rawEvents, 50*time.Millisecond)
+		events := make([]Event, len(got))
+		for i, raw := range got {
+			require.NoError(t, json.Unmarshal([]byte(raw), &events[i]))
+		}
+
+		var boundaries []string
+		for _, e := range events {
+			if e.Type == EventTypeTaskStart || e.Type == EventTypeTaskEnd {
+				boundaries = append(boundaries, fmt.Sprintf("%s:%d", e.Type, e.TaskNum))
+			}
+		}
+		assert.Equal(t, []string{"task_start:1", "task_end:1", "task_start:2", "task_end:2"}, boundaries)
+
+		assert.Equal(t, 0, session.getLastTask(), "review section ended the last task")
+	})
+
+	t.Run("records last task when file ends mid-task", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "progress-mid-task.txt")
+
+		content := `# Ralphex Progress Log
+Plan: docs/plan.md
+Branch: main
+Mode: full
+Started: 2026-01-22 10:00:00
+------------------------------------------------------------
+
+--- task iteration 1 ---
+[26-01-22 10:00:01] task one output
+--- task iteration 2 ---
+[26-01-22 10:00:02] task two output
+`
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+		m := NewSessionManager()
+		defer m.Close()
+		session := NewSession("test-mid-task", path)
+		defer session.Close()
+
+		m.loadProgressFileIntoSession(path, session)
+
+		assert.Equal(t, 2, session.getLastTask(), "task 2 still active at end of file")
+	})
+
+	t.Run("closes final task on completion signal in tasks-only run", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "progress-tasks-only.txt")
+
+		// tasks-only run: ends on the completion signal with no review section
+		// following the last task, so the signal must close the final task.
+		content := `# Ralphex Progress Log
+Plan: docs/plan.md
+Branch: main
+Mode: tasks-only
+Started: 2026-01-22 10:00:00
+------------------------------------------------------------
+
+--- task iteration 1 ---
+[26-01-22 10:00:01] task one output
+--- task iteration 2 ---
+[26-01-22 10:00:02] task two output
+[26-01-22 10:00:03] ` + status.Completed + `
+`
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+		m := NewSessionManager()
+		defer m.Close()
+		session := NewSession("test-tasks-only", path)
+		defer session.Close()
+
+		require.NoError(t, session.Publish(NewOutputEvent(status.PhaseTask, "seed")))
+		rawEvents, cleanup := subscribeSSEEvents(t, session)
+		defer cleanup()
+		_ = drainChannel(rawEvents, 50*time.Millisecond)
+
+		m.loadProgressFileIntoSession(path, session)
+
+		got := drainChannel(rawEvents, 50*time.Millisecond)
+		var boundaries []string
+		for _, raw := range got {
+			var e Event
+			require.NoError(t, json.Unmarshal([]byte(raw), &e))
+			if e.Type == EventTypeTaskStart || e.Type == EventTypeTaskEnd {
+				boundaries = append(boundaries, fmt.Sprintf("%s:%d", e.Type, e.TaskNum))
+			}
+		}
+		assert.Equal(t, []string{"task_start:1", "task_end:1", "task_start:2", "task_end:2"}, boundaries)
+		assert.Equal(t, 0, session.getLastTask(), "completion signal closed the final task")
 	})
 
 	t.Run("captures diffstats from output line", func(t *testing.T) {
@@ -512,6 +708,28 @@ func TestPhaseFromSection(t *testing.T) {
 	}
 }
 
+// regression coverage for round-3 dashboard-routing fix: internal review section
+// labels MUST NOT contain the executor name (e.g. "codex") because phaseFromSection
+// matches "codex" before "review". the fix uses a fixed "review N: ..." label so
+// that under --codex, internal review sections still route to PhaseReview and not
+// PhaseCodex (which is reserved for the external review phase).
+func TestPhaseFromSection_InternalReviewLabelRoutesToReview(t *testing.T) {
+	tests := []struct {
+		name     string
+		section  string
+		expected status.Phase
+	}{
+		{"first review all findings", "review 0: all findings", status.PhaseReview},
+		{"review loop iteration", "review 1: critical/major", status.PhaseReview},
+		{"review loop higher iteration", "review 7: critical/major", status.PhaseReview},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, phaseFromSection(tt.section))
+		})
+	}
+}
+
 func TestSessionManager_LoadProgressFileIntoSessionLargeBuffer(t *testing.T) {
 	t.Run("handles lines larger than default scanner buffer", func(t *testing.T) {
 		dir := t.TempDir()
@@ -546,6 +764,9 @@ Started: 2026-01-22 10:00:00
 	t.Run("handles lines larger than 64MB (no limit)", func(t *testing.T) {
 		if testing.Short() {
 			t.Skip("skipping 65MB allocation in short mode")
+		}
+		if raceEnabled {
+			t.Skip("skipping under -race: parsing a 65MB line takes ~90s without the race detector and exceeds the test binary timeout with it")
 		}
 		dir := t.TempDir()
 		path := filepath.Join(dir, "progress-huge.txt")

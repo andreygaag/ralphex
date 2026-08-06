@@ -17,20 +17,25 @@ import (
 type Values struct {
 	ClaudeCommand              string
 	ClaudeArgs                 string
-	TaskModel                  string   // model for task execution (e.g., "opus", "sonnet", "haiku")
-	ReviewModel                string   // model for review phases (falls back to TaskModel if empty)
-	ClaudeErrorPatterns        []string // patterns to detect in claude output (e.g., rate limit messages)
+	PlanModel                  string // model for plan creation (falls back to TaskModel if empty)
+	TaskModel                  string // model for task execution (e.g., "fable", "opus", "sonnet", "haiku")
+	ReviewModel                string // model for review phases (falls back to TaskModel if empty)
+	ClaudeErrorPatterns        []string
+	CodexErrorPatterns         []string
+	ClaudeLimitPatterns        []string
+	CodexLimitPatterns         []string
+	ClaudeRetryPatterns        []string
 	CodexEnabled               bool
 	CodexEnabledSet            bool // tracks if codex_enabled was explicitly set
 	CodexCommand               string
 	CodexModel                 string
+	CodexModelSet              bool // tracks if codex_model was explicitly set outside embedded defaults
 	CodexReasoningEffort       string
+	CodexReasoningEffortSet    bool // tracks if codex_reasoning_effort was explicitly set outside embedded defaults
 	CodexTimeoutMs             int
 	CodexTimeoutMsSet          bool // tracks if codex_timeout_ms was explicitly set
 	CodexSandbox               string
-	CodexErrorPatterns         []string // patterns to detect in codex output (e.g., rate limit messages)
-	ClaudeLimitPatterns        []string // patterns to detect rate limits in claude output (for wait+retry)
-	CodexLimitPatterns         []string // patterns to detect rate limits in codex output (for wait+retry)
+	CodexSandboxSet            bool // tracks if codex_sandbox was explicitly set outside embedded defaults
 	WaitOnLimit                time.Duration
 	WaitOnLimitSet             bool // tracks if wait_on_limit was explicitly set
 	SessionTimeout             time.Duration
@@ -38,6 +43,7 @@ type Values struct {
 	IdleTimeout                time.Duration // kill session after no output for this duration
 	IdleTimeoutSet             bool          // tracks if idle_timeout was explicitly set
 	ExternalReviewTool         string        // "codex", "custom", or "none"
+	ExternalReviewToolSet      bool          // tracks if external_review_tool was explicitly set in user config (not embedded default)
 	CustomReviewScript         string        // path to custom review script (when ExternalReviewTool = "custom")
 	IterationDelayMs           int
 	IterationDelayMsSet        bool // tracks if iteration_delay_ms was explicitly set
@@ -50,7 +56,11 @@ type Values struct {
 	FinalizeEnabled            bool
 	FinalizeEnabledSet         bool // tracks if finalize_enabled was explicitly set
 	PreserveAnthropicAPIKey    bool
-	PreserveAnthropicAPIKeySet bool // tracks if preserve_anthropic_api_key was explicitly set
+	PreserveAnthropicAPIKeySet bool   // tracks if preserve_anthropic_api_key was explicitly set
+	Executor                   string // "" (= claude, default) or "codex"
+	ExecutorSet                bool   // tracks if executor was explicitly set
+	PassClaudeMd               bool
+	PassClaudeMdSet            bool // tracks if pass_claude_md was explicitly set
 	MovePlanOnCompletion       bool
 	MovePlanOnCompletionSet    bool // tracks if move_plan_on_completion was explicitly set
 	WorktreeEnabled            bool
@@ -162,7 +172,15 @@ func (vl *valuesLoader) parseValuesFromEmbedded() (Values, error) {
 	if err != nil {
 		return Values{}, fmt.Errorf("read embedded defaults: %w", err)
 	}
-	return vl.parseValuesFromBytes(data)
+	values, err := vl.parseValuesFromBytes(data)
+	if err != nil {
+		return Values{}, err
+	}
+	values.CodexModelSet = false
+	values.CodexReasoningEffortSet = false
+	values.CodexSandboxSet = false
+	values.ExternalReviewToolSet = false
+	return values, nil
 }
 
 // parseValuesFromBytes parses configuration from a byte slice into Values.
@@ -185,6 +203,9 @@ func (vl *valuesLoader) parseValuesFromBytes(data []byte) (Values, error) {
 	if key, err := section.GetKey("claude_args"); err == nil {
 		values.ClaudeArgs = key.String()
 	}
+	if key, err := section.GetKey("plan_model"); err == nil {
+		values.PlanModel = key.String()
+	}
 	if key, err := section.GetKey("task_model"); err == nil {
 		values.TaskModel = key.String()
 	}
@@ -206,9 +227,11 @@ func (vl *valuesLoader) parseValuesFromBytes(data []byte) (Values, error) {
 	}
 	if key, err := section.GetKey("codex_model"); err == nil {
 		values.CodexModel = key.String()
+		values.CodexModelSet = true
 	}
 	if key, err := section.GetKey("codex_reasoning_effort"); err == nil {
 		values.CodexReasoningEffort = key.String()
+		values.CodexReasoningEffortSet = true
 	}
 	if key, err := section.GetKey("codex_timeout_ms"); err == nil {
 		val, intErr := key.Int()
@@ -223,11 +246,13 @@ func (vl *valuesLoader) parseValuesFromBytes(data []byte) (Values, error) {
 	}
 	if key, err := section.GetKey("codex_sandbox"); err == nil {
 		values.CodexSandbox = key.String()
+		values.CodexSandboxSet = true
 	}
 
 	// external review settings
 	if key, err := section.GetKey("external_review_tool"); err == nil {
 		values.ExternalReviewTool = key.String()
+		values.ExternalReviewToolSet = true
 	}
 	if key, err := section.GetKey("custom_review_script"); err == nil {
 		values.CustomReviewScript = expandTilde(key.String())
@@ -308,6 +333,27 @@ func (vl *valuesLoader) parseValuesFromBytes(data []byte) (Values, error) {
 		values.PreserveAnthropicAPIKeySet = true
 	}
 
+	// executor selection: "" (= claude, default) or "codex"
+	if key, err := section.GetKey("executor"); err == nil {
+		v := strings.TrimSpace(key.String())
+		if v != "" && v != "codex" {
+			return Values{}, fmt.Errorf("invalid executor %q: must be \"\" (claude) or \"codex\"", v)
+		}
+		values.Executor = v
+		values.ExecutorSet = true
+	}
+
+	// pass_claude_md: when true, codex enables project-level CLAUDE.md fallback
+	// (via project_doc_fallback_filenames) and a user-level CLAUDE.md hint
+	if key, err := section.GetKey("pass_claude_md"); err == nil {
+		val, boolErr := key.Bool()
+		if boolErr != nil {
+			return Values{}, fmt.Errorf("invalid pass_claude_md: %w", boolErr)
+		}
+		values.PassClaudeMd = val
+		values.PassClaudeMdSet = true
+	}
+
 	// move plan on completion
 	if key, err := section.GetKey("move_plan_on_completion"); err == nil {
 		val, boolErr := key.Bool()
@@ -354,89 +400,57 @@ func (vl *valuesLoader) parseValuesFromBytes(data []byte) (Values, error) {
 	values.ClaudeErrorPatterns = vl.parseCommaSeparated(section, "claude_error_patterns")
 	values.CodexErrorPatterns = vl.parseCommaSeparated(section, "codex_error_patterns")
 
-	// limit patterns (comma-separated, same format as error patterns)
+	// limit and transient retry patterns (comma-separated, same format as error patterns)
 	values.ClaudeLimitPatterns = vl.parseCommaSeparated(section, "claude_limit_patterns")
 	values.CodexLimitPatterns = vl.parseCommaSeparated(section, "codex_limit_patterns")
+	values.ClaudeRetryPatterns = vl.parseCommaSeparated(section, "claude_retry_patterns")
 
 	// wait_on_limit duration
-	if err := vl.parseWaitOnLimit(section, &values); err != nil {
+	if d, ok, err := vl.parseDurationKey(section, "wait_on_limit"); err != nil {
 		return Values{}, err
+	} else if ok {
+		values.WaitOnLimit = d
+		values.WaitOnLimitSet = true
 	}
 
 	// session_timeout duration
-	if err := vl.parseSessionTimeout(section, &values); err != nil {
+	if d, ok, err := vl.parseDurationKey(section, "session_timeout"); err != nil {
 		return Values{}, err
+	} else if ok {
+		values.SessionTimeout = d
+		values.SessionTimeoutSet = true
 	}
 
 	// idle_timeout duration
-	if err := vl.parseIdleTimeout(section, &values); err != nil {
+	if d, ok, err := vl.parseDurationKey(section, "idle_timeout"); err != nil {
 		return Values{}, err
+	} else if ok {
+		values.IdleTimeout = d
+		values.IdleTimeoutSet = true
 	}
 
 	return values, nil
 }
 
-// parseWaitOnLimit parses wait_on_limit duration from an INI section.
-func (vl *valuesLoader) parseWaitOnLimit(section *ini.Section, values *Values) error {
-	if !section.HasKey("wait_on_limit") {
-		return nil
+// parseDurationKey parses a non-negative duration from the named INI key.
+// ok is false (with nil error) when the key is absent or empty, so the caller
+// leaves both the value and its *Set sentinel untouched.
+func (vl *valuesLoader) parseDurationKey(section *ini.Section, key string) (time.Duration, bool, error) {
+	if !section.HasKey(key) {
+		return 0, false, nil
 	}
-	val := strings.TrimSpace(section.Key("wait_on_limit").String())
+	val := strings.TrimSpace(section.Key(key).String())
 	if val == "" {
-		return nil
+		return 0, false, nil
 	}
 	d, parseErr := time.ParseDuration(val)
 	if parseErr != nil {
-		return fmt.Errorf("invalid wait_on_limit: %w", parseErr)
+		return 0, false, fmt.Errorf("invalid %s: %w", key, parseErr)
 	}
 	if d < 0 {
-		return fmt.Errorf("invalid wait_on_limit: must be non-negative, got %s", val)
+		return 0, false, fmt.Errorf("invalid %s: must be non-negative, got %s", key, val)
 	}
-	values.WaitOnLimit = d
-	values.WaitOnLimitSet = true
-	return nil
-}
-
-// parseSessionTimeout parses session_timeout duration from an INI section.
-func (vl *valuesLoader) parseSessionTimeout(section *ini.Section, values *Values) error {
-	if !section.HasKey("session_timeout") {
-		return nil
-	}
-	val := strings.TrimSpace(section.Key("session_timeout").String())
-	if val == "" {
-		return nil
-	}
-	d, parseErr := time.ParseDuration(val)
-	if parseErr != nil {
-		return fmt.Errorf("invalid session_timeout: %w", parseErr)
-	}
-	if d < 0 {
-		return fmt.Errorf("invalid session_timeout: must be non-negative, got %s", val)
-	}
-	values.SessionTimeout = d
-	values.SessionTimeoutSet = true
-	return nil
-}
-
-// parseIdleTimeout parses idle_timeout duration from an INI section.
-func (vl *valuesLoader) parseIdleTimeout(section *ini.Section, values *Values) error {
-	if !section.HasKey("idle_timeout") {
-		return nil
-	}
-	val := strings.TrimSpace(section.Key("idle_timeout").String())
-	if val == "" {
-		return nil
-	}
-	d, parseErr := time.ParseDuration(val)
-	if parseErr != nil {
-		return fmt.Errorf("invalid idle_timeout: %w", parseErr)
-	}
-	if d < 0 {
-		return fmt.Errorf("invalid idle_timeout: must be non-negative, got %s", val)
-	}
-	values.IdleTimeout = d
-	values.IdleTimeoutSet = true
-	return nil
+	return d, true, nil
 }
 
 // mergeFrom merges non-empty values from src into dst.
@@ -446,6 +460,9 @@ func (dst *Values) mergeFrom(src *Values) {
 	}
 	if src.ClaudeArgs != "" {
 		dst.ClaudeArgs = src.ClaudeArgs
+	}
+	if src.PlanModel != "" {
+		dst.PlanModel = src.PlanModel
 	}
 	if src.TaskModel != "" {
 		dst.TaskModel = src.TaskModel
@@ -460,20 +477,32 @@ func (dst *Values) mergeFrom(src *Values) {
 	if src.CodexCommand != "" {
 		dst.CodexCommand = src.CodexCommand
 	}
-	if src.CodexModel != "" {
+	if src.CodexModelSet {
+		dst.CodexModel = src.CodexModel
+		dst.CodexModelSet = true
+	} else if src.CodexModel != "" {
 		dst.CodexModel = src.CodexModel
 	}
-	if src.CodexReasoningEffort != "" {
+	if src.CodexReasoningEffortSet {
+		dst.CodexReasoningEffort = src.CodexReasoningEffort
+		dst.CodexReasoningEffortSet = true
+	} else if src.CodexReasoningEffort != "" {
 		dst.CodexReasoningEffort = src.CodexReasoningEffort
 	}
 	if src.CodexTimeoutMsSet {
 		dst.CodexTimeoutMs = src.CodexTimeoutMs
 		dst.CodexTimeoutMsSet = true
 	}
-	if src.CodexSandbox != "" {
+	if src.CodexSandboxSet {
+		dst.CodexSandbox = src.CodexSandbox
+		dst.CodexSandboxSet = true
+	} else if src.CodexSandbox != "" {
 		dst.CodexSandbox = src.CodexSandbox
 	}
-	if src.ExternalReviewTool != "" {
+	if src.ExternalReviewToolSet {
+		dst.ExternalReviewTool = src.ExternalReviewTool
+		dst.ExternalReviewToolSet = true
+	} else if src.ExternalReviewTool != "" {
 		dst.ExternalReviewTool = src.ExternalReviewTool
 	}
 	if src.CustomReviewScript != "" {
@@ -518,6 +547,14 @@ func (dst *Values) mergeExtraFrom(src *Values) {
 		dst.PreserveAnthropicAPIKey = src.PreserveAnthropicAPIKey
 		dst.PreserveAnthropicAPIKeySet = true
 	}
+	if src.ExecutorSet {
+		dst.Executor = src.Executor
+		dst.ExecutorSet = true
+	}
+	if src.PassClaudeMdSet {
+		dst.PassClaudeMd = src.PassClaudeMd
+		dst.PassClaudeMdSet = true
+	}
 	if src.MovePlanOnCompletionSet {
 		dst.MovePlanOnCompletion = src.MovePlanOnCompletion
 		dst.MovePlanOnCompletionSet = true
@@ -552,6 +589,9 @@ func (dst *Values) mergeExtraFrom(src *Values) {
 	}
 	if len(src.CodexLimitPatterns) > 0 {
 		dst.CodexLimitPatterns = src.CodexLimitPatterns
+	}
+	if len(src.ClaudeRetryPatterns) > 0 {
+		dst.ClaudeRetryPatterns = src.ClaudeRetryPatterns
 	}
 	if src.WaitOnLimitSet {
 		dst.WaitOnLimit = src.WaitOnLimit

@@ -1,5 +1,114 @@
 # Changelog
 
+## v1.6.1 - 2026-07-21
+
+### Improved
+
+- Bump golang.org/x/term from 0.44.0 to 0.45.0 #409 @dependabot
+- Bump golang.org/x/sys from 0.46.0 to 0.47.0 #408 @dependabot
+- Bump golang.org/x/net from 0.53.0 to 0.55.0 #401 @dependabot
+
+### Fixed
+
+- Clean codex review output and surface claude subagent progress #417 @umputun
+- Align default review agents with the review-loop contract #414 @alekb
+- Refresh claude and codex at container start (opt-in) #413 @umputun
+- Skip regenerable plugin-manager state when seeding container #405 @umputun
+- Preserve wrapper file mode on --update-script #404 @umputun
+- Bound force-exit cleanup so a stuck worktree removal cannot prevent exit #400 @paskal
+- Skip 65MB parse test under -race to unhang go test -race ./pkg/web #399 @paskal
+- Tolerate coveralls upload failures in CI 032776cc
+
+## v1.6.0 - 2026-06-26
+
+### New Features
+
+- Surface the reason when ralphex refuses to run #392 @umputun
+- Install latest fya in base docker image #390 @umputun
+- Add new Anthropic model Fable to supported agent models #384 @Alex-Kopylov
+- Display user-set run parameters (models, executor) in web dashboard #382 @vlondon
+- Add pi provider support (wrapper + skills) #378 @olomix
+
+### Improved
+
+- Bump actions/checkout from 6 to 7 #391 @dependabot
+- Bump golang.org/x/term from 0.43.0 to 0.44.0 #389 @dependabot
+- Bump golang.org/x/sys from 0.45.0 to 0.46.0 #388 @dependabot
+- Bump gopkg.in/ini.v1 from 1.67.2 to 1.67.3 #387 @dependabot
+
+### Fixed
+
+- Plan panel marks finished tasks done and scrolls to the active task #383 @vlondon
+
+## v1.5.1 - 2026-06-08
+
+### Fixed
+
+- Retry transient HTTP errors (529/502/503/504) without --wait #377 @umputun
+
+## v1.5.0 - 2026-06-03
+
+### New Features
+
+- Add claude_retry_patterns for transient wrapper timeouts #374 @umputun
+
+## v1.4.0 - 2026-05-31
+
+### New Features
+
+- Add Antigravity (agy) CLI wrapper as custom provider #369 @korjavin
+- Add plan model setting #363 @umputun
+
+### Improved
+
+- Refactor processor runner into phase engines #364 @umputun
+- Cut code smells and duplication across packages #373 @umputun
+- Standardize date format on YYYYMMDD- in prompts and skill #371 @umputun
+- Document codex plan creation 07a4cc75
+- Clarify Claude wrapper compatibility a3c9157f
+- Use GitHub warning alert d9e47442
+- Document Claude Agent SDK billing options 3f8b89fa
+- Bump golang.org/x/sys from 0.44.0 to 0.45.0 #360 @dependabot
+
+### Fixed
+
+- Pass model and effort flags #372 @mschedrin
+- Validate model flag values #372 @mschedrin
+
+## v1.3.2 - 2026-05-25
+
+### Improved
+
+- Retry claude 5xx API errors via limit patterns 810840f
+- Dedup CLAUDE.md against llms.txt to clear size threshold b858c05
+- Trim CLAUDE.md verbosity a4853c7
+
+### Fixed
+
+- Detect Claude session-limit message #362 @umputun
+
+## v1.3.1 - 2026-05-22
+
+### New Features
+
+- Per-phase model selection for codex executor #357 @umputun
+
+### Improved
+
+- Reflect codex executor support in README header 15b35c7
+- Reflect codex executor support on landing page 88c3966
+
+## v1.3.0 - 2026-05-21
+
+### New Features
+
+- Add first-class codex executor mode #350 @umputun
+
+### Improved
+
+- Add External-Only Mode section to README #345 @umputun
+- Bump github.com/slack-go/slack from 0.23.0 to 0.23.1 #347 @dependabot
+
 ## v1.2.0 - 2026-05-12
 
 ### New Features

@@ -40,6 +40,7 @@
     const projectCopyBtn = document.getElementById('project-copy');
     const planNameEl = document.getElementById('plan-name');
     const branchNameEl = document.getElementById('branch-name');
+    const runParamsEl = document.getElementById('run-params');
 
     // SSE reconnection constants
     var SSE_INITIAL_RECONNECT_MS = 1000;
@@ -760,6 +761,10 @@
         if (statusValue === 'active') {
             taskEl.classList.add('active');
             statusEl.textContent = '●';
+            // block:'nearest' confines scrolling to the plan panel; block:'start'
+            // walks all scrollable ancestors and can nudge the whole page when
+            // the panel is off-screen.
+            taskEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
         } else if (statusValue === 'done') {
             statusEl.textContent = '✓';
             // mark all checkboxes as checked when task is done
@@ -779,12 +784,20 @@
         }
     }
 
-    // ensure only one task is highlighted as active
+    // ensure only one task is highlighted as active.
+    // tasks run sequentially, so a lower-numbered task losing active status has
+    // finished - mark it done even if its task_end event was never received.
+    // higher-numbered tasks (plan edited mid-run, re-running an earlier task)
+    // fall back to pending unless all their checkboxes are checked.
     function clearActiveTasksExcept(taskNum) {
         var activeTasks = planContent.querySelectorAll('.plan-task.active');
         activeTasks.forEach(function(taskEl) {
             var num = parseInt(taskEl.dataset.taskNum, 10);
             if (num === taskNum) {
+                return;
+            }
+            if (num < taskNum) {
+                updatePlanTaskStatus(num, 'done');
                 return;
             }
             taskEl.classList.remove('active');
@@ -1497,6 +1510,9 @@
             if (branchNameEl) {
                 branchNameEl.textContent = session.branch || '';
             }
+            if (runParamsEl) {
+                runParamsEl.textContent = session.runParams || '';
+            }
             state.currentSession = session;
             updateDiffStats(session.diffStats);
             seedExecutionStartTimeFromSession(session);
@@ -1908,11 +1924,13 @@
     function collectSessionData() {
         const planNameEl = document.querySelector('.plan');
         const branchEl = document.querySelector('.branch');
+        const modelsEl = document.querySelector('.models');
 
         return {
             title: document.title,
             planName: planNameEl ? planNameEl.textContent : 'session',
             branch: branchEl ? branchEl.textContent : '',
+            runParams: modelsEl ? modelsEl.textContent : '',
             elapsed: elapsedTimeEl.textContent || '',
             status: statusBadge.textContent || '',
             statusClass: statusBadge.className.replace('status-badge', '').trim()
@@ -1941,7 +1959,7 @@
     }
 
     // build export HTML header section
-    function buildExportHeader(safeElapsed, safeStatus, safeStatusClass, safePlanName, safeBranch) {
+    function buildExportHeader(safeElapsed, safeStatus, safeStatusClass, safePlanName, safeBranch, safeRunParams) {
         return '<header>\n' +
             '<div class="header-top">\n' +
             '<h1>Ralphex Dashboard</h1>\n' +
@@ -1952,6 +1970,7 @@
             '<div class="info">\n' +
             '<span class="plan">' + safePlanName + '</span>\n' +
             '<span class="branch">' + safeBranch + '</span>\n' +
+            '<span class="models">' + safeRunParams + '</span>\n' +
             '</div>\n</header>\n';
     }
 
@@ -1995,13 +2014,14 @@
         var safeTitle = escapeHtml(data.title);
         var safePlanName = escapeHtml(data.planName);
         var safeBranch = escapeHtml(data.branch);
+        var safeRunParams = escapeHtml(data.runParams);
         var safeElapsed = escapeHtml(data.elapsed);
         var safeStatus = escapeHtml(data.status);
         var safeStatusClass = escapeHtml(data.statusClass);
 
         return buildExportHead(safeTitle, css) +
             '<body>\n' +
-            buildExportHeader(safeElapsed, safeStatus, safeStatusClass, safePlanName, safeBranch) +
+            buildExportHeader(safeElapsed, safeStatus, safeStatusClass, safePlanName, safeBranch, safeRunParams) +
             buildExportNav() +
             buildExportMain(clones);
     }

@@ -54,10 +54,14 @@ const (
 
 // SessionMetadata holds parsed information from progress file header.
 type SessionMetadata struct {
-	PlanPath  string    // path to plan file (from "Plan:" header line)
-	Branch    string    // git branch (from "Branch:" header line)
-	Mode      string    // execution mode: full, review, codex-only (from "Mode:" header line)
-	StartTime time.Time // start time (from "Started:" header line)
+	PlanPath    string    // path to plan file (from "Plan:" header line)
+	Branch      string    // git branch (from "Branch:" header line)
+	Mode        string    // execution mode: full, review, codex-only (from "Mode:" header line)
+	Executor    string    // executor name when not the default claude (from "Executor:" header line)
+	PlanModel   string    // model[:effort] spec for plan creation (from "Plan model:" header line)
+	TaskModel   string    // model[:effort] spec for task execution (from "Task model:" header line)
+	ReviewModel string    // model[:effort] spec for review phases (from "Review model:" header line)
+	StartTime   time.Time // start time (from "Started:" header line)
 }
 
 // defaultTopic is the SSE topic used for all events within a session.
@@ -127,6 +131,13 @@ type Session struct {
 	// it. empty string means nothing is pending.
 	lastPendingSection string
 	lastPendingPhase   status.Phase
+
+	// lastTask is the task number active after the last ingested byte (from
+	// the loader or a previous tailer). used by Reactivate so a resumed tailer
+	// emits a task_end for that task when the next task iteration or phase
+	// transition arrives, instead of leaving it active in the plan panel.
+	// zero means no task was active.
+	lastTask int
 
 	// stopping is true while StopTailing is mid-flight (between the first
 	// locked section that captures tailer/stopCh/feedDone and the final
@@ -209,13 +220,6 @@ func (s *Session) GetTailer() *Tailer {
 	return s.tailer
 }
 
-// SetTailer updates the session's tailer thread-safely.
-func (s *Session) SetTailer(tailer *Tailer) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tailer = tailer
-}
-
 // SetLastModified updates the last modified time thread-safely.
 func (s *Session) SetLastModified(t time.Time) {
 	s.mu.Lock()
@@ -285,6 +289,7 @@ func (s *Session) resetForNewRun() {
 	s.lastPhase = ""
 	s.lastPendingSection = ""
 	s.lastPendingPhase = ""
+	s.lastTask = 0
 	s.loaded = false
 	s.diffStats = nil
 }
@@ -320,6 +325,9 @@ func (s *Session) startTailerLocked(mode tailerStartMode, offset int64) error {
 	cfg := DefaultTailerConfig()
 	if mode != modeFromStart && s.lastPhase != "" {
 		cfg.InitialPhase = s.lastPhase
+	}
+	if mode != modeFromStart {
+		cfg.InitialTask = s.lastTask
 	}
 	if mode == modeResume {
 		cfg.PendingSection = s.lastPendingSection
@@ -487,6 +495,7 @@ func (s *Session) StopTailing() {
 	s.lastOffset = tailer.Offset()
 	s.lastPhase = tailer.Phase()
 	s.lastPendingSection, s.lastPendingPhase = tailer.PendingSection()
+	s.lastTask = tailer.CurrentTask()
 	s.tailer = nil
 	s.stopping = false
 	s.mu.Unlock()
@@ -523,6 +532,22 @@ func (s *Session) setLastPhase(phase status.Phase) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lastPhase = phase
+}
+
+// getLastTask returns the task number active after the last ingested byte, or
+// zero if no task was active. package-internal accessor, thread-safe.
+func (s *Session) getLastTask() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastTask
+}
+
+// setLastTask updates the task number active after the last ingested byte.
+// package-internal accessor, thread-safe.
+func (s *Session) setLastTask(taskNum int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastTask = taskNum
 }
 
 // IsTailing returns whether the session is currently tailing its progress file.

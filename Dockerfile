@@ -39,10 +39,23 @@ ENV USE_BUILTIN_RIPGREP=0
 # mark container environment for ralphex (used to auto-disable codex sandbox)
 ENV RALPHEX_DOCKER=1
 
+# claude's own updater can never apply here: npm installs it root-owned and the container runs as
+# app, so the check only prints a startup notice and changes nothing. disable it; init.sh can refresh
+# both CLIs as root when RALPHEX_CLI_UPDATE is set, which this base image leaves off by default.
+ENV DISABLE_AUTOUPDATER=1
+
 # install claude code and codex globally, verify CLI commands exist
 RUN npm install -g @anthropic-ai/claude-code @openai/codex && \
     command -v claude >/dev/null || { echo "error: claude CLI not found"; exit 1; } && \
     command -v codex >/dev/null || { echo "error: codex CLI not found"; exit 1; }
+
+# install latest fya (claude print-mode PTY wrapper), usable as an optional claude_command provider
+RUN ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && \
+    TAG=$(wget -qO- https://api.github.com/repos/umputun/fya/releases/latest | jq -r .tag_name) && \
+    { [ -n "$TAG" ] && [ "$TAG" != "null" ]; } || { echo "error: could not resolve latest fya release"; exit 1; } && \
+    wget -qO- "https://github.com/umputun/fya/releases/download/${TAG}/fya_${TAG#v}_linux_${ARCH}.tar.gz" | \
+        tar -xz -C /usr/local/bin fya && \
+    fya --version >/dev/null || { echo "error: fya CLI not runnable"; exit 1; }
 
 # copy ralphex binary
 COPY --from=build /build/ralphex /srv/ralphex

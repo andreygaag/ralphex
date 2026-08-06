@@ -6,6 +6,7 @@ import io
 import os
 import platform
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -43,6 +44,7 @@ from ralphex_dk import (  # noqa: E402
     get_claude_provider,
     get_docker_socket_gid,
     get_global_gitignore,
+    handle_update_script,
     is_docker_enabled,
     is_sensitive_name,
     keychain_service_name,
@@ -355,6 +357,46 @@ class TestDetectTimezone(unittest.TestCase):
                 os.environ.pop("TZ", None)
             else:
                 os.environ["TZ"] = old
+
+    def test_cli_update_forwarded_when_set(self) -> None:
+        """RALPHEX_CLI_UPDATE reaches the container so init.sh runs the cli refresh."""
+        old = os.environ.get("RALPHEX_CLI_UPDATE")
+        try:
+            os.environ["RALPHEX_CLI_UPDATE"] = "1"
+            self.assertIn("RALPHEX_CLI_UPDATE=1", build_base_env_vars())
+        finally:
+            if old is None:
+                os.environ.pop("RALPHEX_CLI_UPDATE", None)
+            else:
+                os.environ["RALPHEX_CLI_UPDATE"] = old
+
+    def test_help_forces_cli_update_off(self) -> None:
+        """--help renders help only, but the image entrypoint runs init.sh whatever the command is,
+        so the help path forces the refresh off instead of paying for an npm install it cannot use."""
+        src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ralphex-dk.sh")
+        with open(src) as f:
+            body = f.read()
+        marker = '[image, "/srv/ralphex", "--help"]'
+        self.assertIn(marker, body)
+        # the docker run that builds the help command must force the refresh off
+        help_block = body[:body.index(marker)]
+        help_block = help_block[help_block.rindex('["docker", "run", "--rm"]'):]
+        self.assertIn('"RALPHEX_CLI_UPDATE=0"', help_block)
+
+    def test_cli_update_absent_by_default(self) -> None:
+        """update is opt-in: nothing is forwarded when the flag is unset or empty, leaving the
+        image's own default in charge."""
+        old = os.environ.get("RALPHEX_CLI_UPDATE")
+        try:
+            os.environ.pop("RALPHEX_CLI_UPDATE", None)
+            self.assertFalse([e for e in build_base_env_vars() if e.startswith("RALPHEX_CLI_UPDATE=")])
+            os.environ["RALPHEX_CLI_UPDATE"] = ""
+            self.assertFalse([e for e in build_base_env_vars() if e.startswith("RALPHEX_CLI_UPDATE=")])
+        finally:
+            if old is None:
+                os.environ.pop("RALPHEX_CLI_UPDATE", None)
+            else:
+                os.environ["RALPHEX_CLI_UPDATE"] = old
 
 class TestExtractCredentials(unittest.TestCase):
     def test_write_pattern_adds_trailing_newline(self) -> None:
@@ -1031,6 +1073,38 @@ class TestMainArgparse(EnvTestCase):
             result = main()
         self.assertEqual(len(calls), 1)
         self.assertEqual(result, 0)
+
+    def test_update_script_preserves_readable_mode(self) -> None:
+        """updated wrapper keeps its 0755 mode, not 0711 unreadable by non-owner (issue #397)."""
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            script_path = tmp / "ralphex"
+            script_path.write_text("#!/usr/bin/env python3\n# old\n")
+            script_path.chmod(0o755)
+            new_content = b"#!/usr/bin/env python3\n# new\n"
+
+            class _Resp:
+                def __enter__(self_inner):
+                    return self_inner
+
+                def __exit__(self_inner, *_a):
+                    return False
+
+                def read(self_inner):
+                    return new_content
+
+            with unittest.mock.patch("ralphex_dk.urlopen", return_value=_Resp()), \
+                    unittest.mock.patch("sys.stdin", io.StringIO("y\n")), \
+                    unittest.mock.patch("sys.stderr", io.StringIO()):
+                rc = handle_update_script(script_path)
+
+            self.assertEqual(rc, 0)
+            mode = script_path.stat().st_mode & 0o777
+            self.assertTrue(mode & stat.S_IROTH, f"world-read bit lost, mode={oct(mode)}")
+            self.assertEqual(mode, 0o755, f"expected 0755 preserved, got {oct(mode)}")
+            self.assertEqual(script_path.read_text(), new_content.decode())
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_env_flags_build_cli_env(self) -> None:
         """CLI -E/--env flags are converted to docker -e flags."""
